@@ -163,7 +163,15 @@ st.sidebar.header("📐 1. パラメーター設定")
 st.sidebar.subheader("治具ポケット加工 (エンドミル)")
 d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
 clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
-z_pocket = st.sidebar.number_input("ポケット深さ $Z_{\\text{depth}}$ (mm)", value=-5.0, max_value=0.0)
+
+# ★★★ 修正箇所: アクリルの厚みを新たな入力とする ★★★
+acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
+overcut_depth = st.sidebar.number_input("ポケットのオーバーカット $D_{\\text{over}}$ (mm)", value=0.2, min_value=0.0)
+
+# アクリルの厚みとオーバーカットからポケット深さを計算
+z_pocket = - (acrylic_thickness + overcut_depth)
+st.sidebar.markdown(f"> **計算されたポケット深さ $Z_{\\text{depth}}$**: $\\bf{{ {z_pocket:.2f} }}$ mm")
+# ★★★ 修正完了 ★★★
 
 # Vビット面取り設定
 st.sidebar.subheader("Vビット面取り加工")
@@ -201,10 +209,10 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
 
     with col1:
         st.header("1️⃣ 治具ポケット加工パス")
-        st.subheader(f"Gコード (工具径: {d_em}mm, 深さ: {z_pocket}mm)")
+        st.subheader(f"Gコード (工具径: {d_em}mm, 深さ: {z_pocket:.2f}mm)")
         st.code(pocket_gcode)
         
-        # ★★★ ダウンロード機能の追加 ★★★
+        # ダウンロード機能
         st.download_button(
             label="Gコードをダウンロード (治具ポケット)",
             data=pocket_gcode,
@@ -238,10 +246,10 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
 
     with col2:
         st.header("2️⃣ Vビット面取り加工パス")
-        st.subheader(f"Gコード (面取り幅: {w_chamfer}mm, 深さ: {z_chamfer}mm)")
+        st.subheader(f"Gコード (面取り幅: {w_chamfer}mm, 深さ: {z_chamfer:.2f}mm)")
         st.code(chamfer_gcode)
 
-        # ★★★ ダウンロード機能の追加 ★★★
+        # ダウンロード機能
         st.download_button(
             label="Gコードをダウンロード (Vビット面取り)",
             data=chamfer_gcode,
