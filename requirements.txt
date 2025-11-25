@@ -1,0 +1,7 @@
+streamlit
+numpy
+shapely
+matplotlib
+# 今回新しく追加したいライブラリ
+pandas==2.1.4  # バージョンを指定することも可能
+openpyxl       # Excelファイルを扱うライブラリ
