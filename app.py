@@ -73,21 +73,14 @@ def add_dogbone_relief(polygon, diameter):
             v_in_n = v_in / np.linalg.norm(v_in)
             v_out_n = v_out / np.linalg.norm(v_out)
             
-            # 内角の判定（外積や内積で厳密にやるべきだが、ここでは単純な四角形と仮定）
-            # もし内角であれば、逃げの点を追加
-            
-            # 逃げの点を追加 (v_in方向へ延長)
-            relief_pt1 = np.array(current) - v_in_n * relief_offset
-            # 逃げの点を追加 (v_out方向へ延長)
-            relief_pt2 = np.array(current) - v_out_n * relief_offset
-            
-            # 逃げは2点ではなく、角から一つ離れた点を追加するだけでOK (パスの挿入)
-            # シンプルに角の後に少しだけ切り込む点 (ここでは前の点へ戻るパス)を挿入する
-            
             # 逃げ処理の追加
             # 1. 逃げの点へ移動 (前方向へ)
-            new_coords.append(tuple(relief_pt1))
+            relief_pt1 = np.array(current) - v_in_n * relief_offset
             # 2. 逃げの点へ移動 (次方向へ)
+            relief_pt2 = np.array(current) - v_out_n * relief_offset
+            
+            # 角を突き抜けるようにパスを挿入
+            new_coords.append(tuple(relief_pt1))
             new_coords.append(tuple(relief_pt2))
             
     # 最後に閉じる
@@ -132,13 +125,9 @@ def generate_pocket_paths(polygon, diameter, clearance, z_depth, dogbone=True):
             
     # 3. 角の逃げ処理 (ドッグボーン型)
     if dogbone and tool_paths:
-        # 最外周のパス (治具の境界線) のみに逃げを適用
-        # 治具の境界線は、元の部品の形状にオフセットを加えたものなので、元の部品の形状（Polygon.exterior）を使うべきだが、
-        # ここではシンプルに最初のパス (最も外側のパス) に適用する
-        
-        # Note: 治具のパスは外周で閉じているが、ShapelyのLineStringに変換して、
-        # 逃げの座標を挿入する。
+        # 最外周のパス (治具の境界線) に逃げを適用
         line_path = tool_paths[0]
+        # LineStringの座標リストをPolygonに変換してから逃げ処理を適用
         tool_paths[0] = add_dogbone_relief(Polygon(line_path), diameter)
 
     return tool_paths
@@ -179,7 +168,11 @@ z_pocket = st.sidebar.number_input("ポケット深さ $Z_{\\text{depth}}$ (mm)"
 # Vビット面取り設定
 st.sidebar.subheader("Vビット面取り加工")
 w_chamfer = st.sidebar.number_input("面取り幅 $W$ (mm)", value=0.5, min_value=0.01)
-st.sidebar.markdown(f"> **深さ $Z_{\\text{chamfer}}$**: $\\bf{-{w_chamfer}}$ mm (90度Vビットのため)")
+
+# ★★★ 修正箇所 ★★★
+# LaTeXの$Z_{\text{chamfer}}$の表記を、シンプルなMarkdownとf-stringの組み合わせに修正
+st.sidebar.markdown(f"> **深さ $Z$**: **-{w_chamfer}** mm (90度Vビットのため)") 
+# ★★★ 修正完了 ★★★
 
 # 共通設定
 st.sidebar.subheader("共通設定")
