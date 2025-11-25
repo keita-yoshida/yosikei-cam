@@ -153,7 +153,7 @@ def generate_chamfer_paths(polygon, chamfer_width):
 # --- Streamlit アプリケーション ---
 
 st.set_page_config(layout="wide")
-st.title("簡易 Web CAM (Python/Streamlit)")
+st.title("よしけいCAM")
 st.caption("治具ポケット加工とVビット面取りのパス生成プロトタイプ")
 
 # サイドバーでのパラメーター設定
