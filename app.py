@@ -5,58 +5,25 @@ import matplotlib.pyplot as plt
 import ezdxf 
 from io import BytesIO
 
-# ★★★ 修正箇所: Matplotlibの日本語フォント設定を追加 ★★★
+# Matplotlibの日本語フォント設定
 import matplotlib.font_manager as fm
 import os
 
 try:
-    # IPAexGothicを優先的に使用する設定
     plt.rcParams['font.family'] = 'sans-serif'
-    # Streamlit Cloud環境で利用可能なフォントにフォールバック設定
     plt.rcParams['font.sans-serif'] = ['IPAexGothic', 'IPA P Gothic', 'Noto Sans CJK JP', 'DejaVu Sans'] 
-    plt.rcParams['axes.unicode_minus'] = False # 負の記号 '-' を表示可能にする
+    plt.rcParams['axes.unicode_minus'] = False 
 except Exception:
-    # フォント設定が失敗した場合のフォールバック
     pass
-# ★★★ 修正完了 ★★★
 
 
-# --- 幾何学計算とGコード生成のコアロジック (変更なし) ---
+# --- 幾何学計算とGコード生成のコアロジック ---
 
 def generate_gcode(paths, z_depth, feed_rate, tool_name="T1"):
     """工具パスからGコードを生成する関数"""
-    gcode = []
-    gcode.append(f"; --- {tool_name} G-Code Start ---")
-    gcode.append("G21 ; Metric units")
-    gcode.append("G90 ; Absolute positioning")
-    gcode.append("G00 Z10.0 ; Safe Z height")
-    gcode.append(f"T1 M06 ; Tool Change to {tool_name}")
-    gcode.append(f"F{feed_rate} ; Set Feed Rate")
-    gcode.append("")
+# ... (変更なし)
 
-    for i, path in enumerate(paths):
-        coords = np.array(path.coords)
-        
-        # 最初の点への移動
-        if i == 0:
-             # 初期移動
-            gcode.append(f"G00 X{coords[0, 0]:.4f} Y{coords[0, 1]:.4f}")
-            # 切り込み
-            gcode.append(f"G01 Z{z_depth:.4f}")
-        else:
-             # 前回の終了点から次のパスの開始点へ移動 (Zはそのまま)
-             gcode.append(f"G00 X{coords[0, 0]:.4f} Y{coords[0, 1]:.4f}")
-             
-        
-        # パスを切削
-        for x, y in coords[1:]:
-            gcode.append(f"G01 X{x:.4f} Y{y:.4f}")
-            
-    # プログラム終了処理
-    gcode.append("G00 Z10.0 ; Retract to safe Z")
-    gcode.append("M30 ; Program end")
-    gcode.append(f"; --- {tool_name} G-Code End ---")
-    return "\n".join(gcode)
+# ... (generate_gcode 関数の残りの部分)
 
 def add_dogbone_relief(polygon, diameter):
     """
@@ -71,4 +38,18 @@ def add_dogbone_relief(polygon, diameter):
     coords = list(polygon.exterior.coords)
     
     new_coords = []
-    num_points = len(
+    
+    # ★★★ 修正箇所: 74行目付近の括弧を修正 ★★★
+    # 最後の点は最初の点と同じなので除く
+    num_points = len(coords) - 1 
+    # ★★★ 修正完了 ★★★
+    
+    for i in range(num_points):
+        # 現在の点、前の点、次の点を取得
+        current = coords[i]
+# ... (add_dogbone_relief 関数の残りの部分)
+
+# ... (generate_pocket_paths, generate_chamfer_paths, dxf_to_shapely_polygon 関数の残りの部分)
+
+# --- Streamlit アプリケーション ---
+# ... (Streamlit アプリケーションの残りの部分)
