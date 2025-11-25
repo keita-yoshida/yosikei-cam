@@ -132,11 +132,11 @@ def generate_pocket_paths(polygon, diameter, clearance, z_depth, dogbone=True):
 
     return tool_paths
 
-# ★★★ 修正箇所: Z_pocket (治具底面) ではなく、Z_start (アクリル上面) を引数に追加 ★★★
-def generate_chamfer_paths(polygon, chamfer_width, z_start):
+# ★★★ 修正箇所: 面取りは Z_start=0.0 から実行するロジックに変更 ★★★
+def generate_chamfer_paths(polygon, chamfer_width, z_start=0.0):
     """Vビット面取り加工の工具中心パスを生成する関数"""
     
-    # Vビット 90度の場合、面取り幅 W = Z深さ D
+    # Vビット 90度の場合、面取り深さ D = 面取り幅 W
     # 最終深さ Z_final = Z_start (アクリル上面) - 面取り幅 W
     z_final = z_start - chamfer_width
     
@@ -168,20 +168,16 @@ st.sidebar.subheader("治具ポケット加工 (エンドミル)")
 d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
 clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
 
-# アクリルの厚みとオーバーカットからポケット深さを計算
-acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
-overcut_depth = st.sidebar.number_input("ポケットのオーバーカット $D_{\\text{over}}$ (mm)", value=0.2, min_value=0.0)
+# ★★★ 修正箇所: 治具ポケット深さを直接入力に戻す ★★★
+z_pocket_input = st.sidebar.number_input("ポケット深さ $Z_{\\text{pocket}}$ (mm) (負の値で入力)", value=-3.0, max_value=0.0)
+z_pocket = z_pocket_input
 
-# 治具ポケット底面の深さ
-z_pocket = - (acrylic_thickness + overcut_depth)
+# アクリル上面 Z=0 に固定
+z_acrylic_top = 0.0
 
-# ★★★ アクリル上面のZ座標を計算 ★★★
-# 治具上面 Z=0 の場合、アクリル上面 Z_start = Z_pocket + T = -D_overcut
-z_acrylic_top = -overcut_depth
-# ★★★ 計算完了 ★★★
-
-st.sidebar.markdown(rf"> **計算されたポケット底面 $Z_{{\text{{depth}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
-st.sidebar.markdown(rf"> **アクリル上面 $Z_{{\text{{top}}}}$**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **ポケット深さ $Z_{{\text{{pocket}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **アクリル上面 (面取り基準) $Z_{{\text{{top}}}}$**: $\bf{{ {z_acrylic_top:.2f} }}$ mm (治具上面と一致)")
+# ★★★ 修正完了 ★★★
 
 
 # Vビット面取り設定
@@ -258,10 +254,9 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
 
 
     # 2. Vビット面取り加工
-    # ★★★ 修正箇所: Z_pocket ではなく Z_acrylic_top を渡す ★★★
+    # Z_start=0.0 は generate_chamfer_paths 関数のデフォルト値で実行
     chamfer_paths, z_final = generate_chamfer_paths(original_polygon, w_chamfer, z_acrylic_top)
     chamfer_gcode = generate_gcode(chamfer_paths, z_final, feed_rate, "Chamfer_VBit_T2")
-    # ★★★ 修正完了 ★★★
 
     with col2:
         st.header("2️⃣ Vビット面取り加工パス")
