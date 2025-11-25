@@ -1,9 +1,14 @@
 import streamlit as st
 import numpy as np
-from shapely.geometry import Polygon, LineString, mapping
+from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
 import matplotlib.pyplot as plt
+# ★★★ 新規インポート ★★★
+import ezdxf 
+from io import BytesIO
+# ★★★ 新規インポート ★★★
 
-# --- 幾何学計算とGコード生成のコアロジック ---
+# --- 幾何学計算とGコード生成のコアロジック (変更なし) ---
+# (generate_gcode, add_dogbone_relief, generate_pocket_paths, generate_chamfer_paths 関数は変更なし)
 
 def generate_gcode(paths, z_depth, feed_rate, tool_name="T1"):
     """工具パスからGコードを生成する関数"""
@@ -152,6 +157,52 @@ def generate_chamfer_paths(polygon, chamfer_width, z_start):
     return [chamfer_path], z_final
 
 
+# --- DXF/SVG 読み込みロジック ★★★ 新規追加 ★★★ ---
+
+def dxf_to_shapely_polygon(uploaded_file):
+    """DXFファイルを読み込み、Shapely Polygonに変換する (PLINE, LWPOLYLINE, LINEのみ対応)"""
+    
+    if uploaded_file is None:
+        return None, "ファイルがアップロードされていません。"
+    
+    try:
+        # アップロードされたファイルをメモリ上のバイナリとして読み込む
+        dxf_bytes = uploaded_file.read()
+        doc = ezdxf.read(BytesIO(dxf_bytes))
+        msp = doc.modelspace()
+        
+        polylines = []
+        
+        for entity in msp:
+            if entity.dxftype() == 'LWPOLYLINE' or entity.dxftype() == 'POLYLINE':
+                # ポリラインの頂点を取得
+                coords = [(p[0], p[1]) for p in entity.vertices()]
+                
+                # 閉じたポリラインの場合はPolygonとして処理
+                if entity.is_closed:
+                    try:
+                        polylines.append(Polygon(coords))
+                    except Exception:
+                        st.warning(f"Polygon変換に失敗したポリラインがあります。")
+                else:
+                    # 閉じていない場合は LineStringとして処理するか無視 (今回は治具ポケット用なので無視)
+                    pass 
+        
+        if not polylines:
+            return None, "DXFファイル内に閉じたポリライン (LWPOLYLINE/POLYLINE) が見つかりませんでした。"
+        
+        # 複数のポリゴンが見つかった場合、最大の面積を持つものを治具形状として採用
+        if len(polylines) > 1:
+            main_polygon = max(polylines, key=lambda p: p.area)
+            return main_polygon, f"複数の図形を検出。最大面積の図形（頂点数: {len(main_polygon.exterior.coords)}）を採用しました。"
+        else:
+            return polylines[0], f"図形を検出しました。（頂点数: {len(polylines[0].exterior.coords)}）"
+
+    except ezdxf.DXFStructureError as e:
+        return None, f"DXFファイルの構造エラーです: {e}"
+    except Exception as e:
+        return None, f"ファイルの読み込み中に予期せぬエラーが発生しました: {e}"
+
 # --- Streamlit アプリケーション ---
 
 st.set_page_config(layout="wide")
@@ -166,7 +217,6 @@ st.sidebar.subheader("治具ポケット加工 (エンドミル)")
 d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
 clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
 
-# ★★★ 修正箇所: 治具ポケット深さとアクリル厚の両方を入力に戻す ★★★
 # 治具ポケット深さ (固定のための深さ)
 z_pocket_input = st.sidebar.number_input("治具ポケット深さ $Z_{\\text{pocket}}$ (mm) (負の値で入力)", value=-1.0, max_value=0.0)
 z_pocket = z_pocket_input
@@ -180,7 +230,6 @@ z_acrylic_top = z_pocket + acrylic_thickness
 
 st.sidebar.markdown(rf"> **ポケット深さ $Z_{{\text{{pocket}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
 st.sidebar.markdown(rf"> **アクリル上面 (面取り基準) $Z_{{\text{{top}}}}$**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
-# ★★★ 修正完了 ★★★
 
 
 # Vビット面取り設定
@@ -199,18 +248,53 @@ st.sidebar.subheader("共通設定")
 feed_rate = st.sidebar.number_input("送り速度 $F$ (mm/min)", value=1000, min_value=100)
 add_dogbone = st.sidebar.checkbox("治具に角の逃げ (Dogbone) を追加", value=True)
 
-# 形状データの定義 (DXF/SVGの代わりに手動で定義)
-st.subheader("🛠️ 2. 部品形状データ (デモ用)")
-st.info("通常はここでDXF/SVGファイルを読み込みます。今回は仮の四角形を使用します。")
-# 外周 100x50 の四角形
-coords = [(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]
-original_polygon = Polygon(coords)
-st.code(f"元の形状 (四角形): 100mm x 50mm")
+
+# --- 形状データの定義をファイルアップロードに変更 ---
+st.subheader("🛠️ 2. 部品形状データ (DXF/SVG 読み込み)")
+
+uploaded_file = st.file_uploader(
+    "DXF または SVG ファイルをアップロードしてください", 
+    type=['dxf', 'svg']
+)
+
+original_polygon = None
+file_status = "ファイルがアップロードされていません。"
+
+if uploaded_file is not None:
+    file_extension = uploaded_file.name.split('.')[-1].lower()
+    
+    if file_extension == 'dxf':
+        original_polygon, file_status = dxf_to_shapely_polygon(uploaded_file)
+    elif file_extension == 'svg':
+        # SVGの読み込みはより複雑ですが、ここではシンプルなエラーメッセージを返す
+        file_status = "現在、SVGファイルの複雑なパスの解析はサポートされていません。DXFファイルの使用を推奨します。"
+        # 代替として、デモ用の四角形を使うことも可能だが、今回は読み込みに失敗したものとして扱う
+        # coords = [(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]
+        # original_polygon = Polygon(coords)
+    else:
+        file_status = "サポートされていないファイル形式です。"
+        
+    if original_polygon is None:
+        st.error(f"ファイル解析エラー: {file_status}")
+    else:
+        st.success(f"ファイル解析成功: {file_status}")
+        
+else:
+    # ファイルがない場合はデモ用の四角形を使用 (動作確認用)
+    st.info("ファイルがアップロードされていないため、デモ用の100mm x 50mmの四角形を使用します。")
+    coords = [(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]
+    original_polygon = Polygon(coords)
+
+st.code(f"採用された形状: {'デモ用四角形' if original_polygon and len(original_polygon.exterior.coords) == 5 else uploaded_file.name if uploaded_file else 'なし'}")
 
 # --- メイン処理 ---
 
 if st.button("🚀 Gコードを生成 & パスを計算"):
     
+    if original_polygon is None:
+        st.error("図形データが見つからないため、Gコードを生成できません。有効なファイルをアップロードしてください。")
+        st.stop()
+        
     col1, col2 = st.columns(2)
 
     # 1. 治具ポケット加工
