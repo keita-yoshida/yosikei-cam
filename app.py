@@ -153,7 +153,7 @@ def generate_chamfer_paths(polygon, chamfer_width):
 # --- Streamlit アプリケーション ---
 
 st.set_page_config(layout="wide")
-st.title("よしけいCAM")
+st.title("簡易 Web CAM (Python/Streamlit)")
 st.caption("治具ポケット加工とVビット面取りのパス生成プロトタイプ")
 
 # サイドバーでのパラメーター設定
@@ -168,11 +168,7 @@ z_pocket = st.sidebar.number_input("ポケット深さ $Z_{\\text{depth}}$ (mm)"
 # Vビット面取り設定
 st.sidebar.subheader("Vビット面取り加工")
 w_chamfer = st.sidebar.number_input("面取り幅 $W$ (mm)", value=0.5, min_value=0.01)
-
-# ★★★ 修正箇所 ★★★
-# LaTeXの$Z_{\text{chamfer}}$の表記を、シンプルなMarkdownとf-stringの組み合わせに修正
 st.sidebar.markdown(f"> **深さ $Z$**: **-{w_chamfer}** mm (90度Vビットのため)") 
-# ★★★ 修正完了 ★★★
 
 # 共通設定
 st.sidebar.subheader("共通設定")
@@ -201,12 +197,21 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
         z_depth=z_pocket, 
         dogbone=add_dogbone
     )
-    pocket_gcode = generate_gcode(pocket_paths, z_pocket, feed_rate, "Pocket Endmill")
+    pocket_gcode = generate_gcode(pocket_paths, z_pocket, feed_rate, "Pocket_EM_T1")
 
     with col1:
         st.header("1️⃣ 治具ポケット加工パス")
         st.subheader(f"Gコード (工具径: {d_em}mm, 深さ: {z_pocket}mm)")
         st.code(pocket_gcode)
+        
+        # ★★★ ダウンロード機能の追加 ★★★
+        st.download_button(
+            label="Gコードをダウンロード (治具ポケット)",
+            data=pocket_gcode,
+            file_name="pocket_gcode.nc",
+            mime="text/plain",
+            key="download_pocket"
+        )
         
         # パスの描画
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -214,7 +219,6 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
         
         if pocket_paths:
             for i, path in enumerate(pocket_paths):
-                # Shapely LineStringの座標を取得してプロット
                 if path.geom_type == 'LineString' or path.geom_type == 'LinearRing':
                     color = 'blue' if i == 0 else 'lightblue'
                     label = 'Tool Path (Boundary)' if i == 0 else None
@@ -230,12 +234,21 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
 
     # 2. Vビット面取り加工
     chamfer_paths, z_chamfer = generate_chamfer_paths(original_polygon, w_chamfer)
-    chamfer_gcode = generate_gcode(chamfer_paths, z_chamfer, feed_rate, "Chamfer V-Bit")
+    chamfer_gcode = generate_gcode(chamfer_paths, z_chamfer, feed_rate, "Chamfer_VBit_T2")
 
     with col2:
         st.header("2️⃣ Vビット面取り加工パス")
         st.subheader(f"Gコード (面取り幅: {w_chamfer}mm, 深さ: {z_chamfer}mm)")
         st.code(chamfer_gcode)
+
+        # ★★★ ダウンロード機能の追加 ★★★
+        st.download_button(
+            label="Gコードをダウンロード (Vビット面取り)",
+            data=chamfer_gcode,
+            file_name="chamfer_gcode.nc",
+            mime="text/plain",
+            key="download_chamfer"
+        )
 
         # パスの描画
         fig2, ax2 = plt.subplots(figsize=(6, 4))
