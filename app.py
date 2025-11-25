@@ -164,13 +164,14 @@ st.sidebar.subheader("治具ポケット加工 (エンドミル)")
 d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
 clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
 
-# ★★★ 修正箇所: アクリルの厚みを新たな入力とする ★★★
+# アクリルの厚みとオーバーカットからポケット深さを計算
 acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
 overcut_depth = st.sidebar.number_input("ポケットのオーバーカット $D_{\\text{over}}$ (mm)", value=0.2, min_value=0.0)
 
-# アクリルの厚みとオーバーカットからポケット深さを計算
 z_pocket = - (acrylic_thickness + overcut_depth)
-st.sidebar.markdown(f"> **計算されたポケット深さ $Z_{\\text{depth}}$**: $\\bf{{ {z_pocket:.2f} }}$ mm")
+
+# ★★★ 修正箇所: f-stringをraw stringにし、LaTeX表記を修正 ★★★
+st.sidebar.markdown(rf"> **計算されたポケット深さ $Z_{{\text{{depth}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
 # ★★★ 修正完了 ★★★
 
 # Vビット面取り設定
