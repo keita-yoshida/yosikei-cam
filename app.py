@@ -132,22 +132,26 @@ def generate_pocket_paths(polygon, diameter, clearance, z_depth, dogbone=True):
 
     return tool_paths
 
-def generate_chamfer_paths(polygon, chamfer_width):
+# ★★★ 修正箇所: Z_pocket (治具底面) ではなく、Z_start (アクリル上面) を引数に追加 ★★★
+def generate_chamfer_paths(polygon, chamfer_width, z_start):
     """Vビット面取り加工の工具中心パスを生成する関数"""
+    
     # Vビット 90度の場合、面取り幅 W = Z深さ D
-    z_depth = -chamfer_width
+    # 最終深さ Z_final = Z_start (アクリル上面) - 面取り幅 W
+    z_final = z_start - chamfer_width
     
     # 1. $X, Y$ 経路の決定 (外側に面取り幅 W だけオフセット)
     try:
         chamfer_path = polygon.exterior.buffer(chamfer_width, join_style=2)
     except Exception:
-        return [], z_depth
+        return [], z_final
         
     # 面取りパスは1本の線 (LineString) なので、その座標を返す
     if chamfer_path.geom_type == 'Polygon':
-        return [chamfer_path.exterior], z_depth
+        return [chamfer_path.exterior], z_final
     
-    return [chamfer_path], z_depth
+    return [chamfer_path], z_final
+# ★★★ 修正完了 ★★★
 
 
 # --- Streamlit アプリケーション ---
@@ -168,16 +172,28 @@ clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, mi
 acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
 overcut_depth = st.sidebar.number_input("ポケットのオーバーカット $D_{\\text{over}}$ (mm)", value=0.2, min_value=0.0)
 
+# 治具ポケット底面の深さ
 z_pocket = - (acrylic_thickness + overcut_depth)
 
-# ★★★ 修正箇所: f-stringをraw stringにし、LaTeX表記を修正 ★★★
-st.sidebar.markdown(rf"> **計算されたポケット深さ $Z_{{\text{{depth}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
-# ★★★ 修正完了 ★★★
+# ★★★ アクリル上面のZ座標を計算 ★★★
+# 治具上面 Z=0 の場合、アクリル上面 Z_start = Z_pocket + T = -D_overcut
+z_acrylic_top = -overcut_depth
+# ★★★ 計算完了 ★★★
+
+st.sidebar.markdown(rf"> **計算されたポケット底面 $Z_{{\text{{depth}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **アクリル上面 $Z_{{\text{{top}}}}$**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
+
 
 # Vビット面取り設定
 st.sidebar.subheader("Vビット面取り加工")
 w_chamfer = st.sidebar.number_input("面取り幅 $W$ (mm)", value=0.5, min_value=0.01)
-st.sidebar.markdown(f"> **深さ $Z$**: **-{w_chamfer}** mm (90度Vビットのため)") 
+
+# 面取り最終深さを計算し表示
+z_chamfer_final = z_acrylic_top - w_chamfer
+
+st.sidebar.markdown(rf"> **面取り開始点**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **面取り最終深さ $Z_{{\text{{final}}}}$**: $\bf{{ {z_chamfer_final:.2f} }}$ mm")
+
 
 # 共通設定
 st.sidebar.subheader("共通設定")
@@ -242,12 +258,14 @@ if st.button("🚀 Gコードを生成 & パスを計算"):
 
 
     # 2. Vビット面取り加工
-    chamfer_paths, z_chamfer = generate_chamfer_paths(original_polygon, w_chamfer)
-    chamfer_gcode = generate_gcode(chamfer_paths, z_chamfer, feed_rate, "Chamfer_VBit_T2")
+    # ★★★ 修正箇所: Z_pocket ではなく Z_acrylic_top を渡す ★★★
+    chamfer_paths, z_final = generate_chamfer_paths(original_polygon, w_chamfer, z_acrylic_top)
+    chamfer_gcode = generate_gcode(chamfer_paths, z_final, feed_rate, "Chamfer_VBit_T2")
+    # ★★★ 修正完了 ★★★
 
     with col2:
         st.header("2️⃣ Vビット面取り加工パス")
-        st.subheader(f"Gコード (面取り幅: {w_chamfer}mm, 深さ: {z_chamfer:.2f}mm)")
+        st.subheader(f"Gコード (面取り幅: {w_chamfer}mm, 深さ: {z_final:.2f}mm)")
         st.code(chamfer_gcode)
 
         # ダウンロード機能
