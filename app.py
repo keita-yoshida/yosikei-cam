@@ -129,15 +129,18 @@ def dxf_to_shapely_polygon(uploaded_file):
         return None, "ファイルがアップロードされていません。"
     
     try:
-        # ★★★ 修正箇所: ファイルポインタをリセットし、バイトデータを確実に取得 ★★★
-        uploaded_file.seek(0) # ファイルポインタを先頭に戻す
-        dxf_bytes = uploaded_file.read()
+        # 1. ファイルポインタを先頭に戻す (再読み込みに備える)
+        uploaded_file.seek(0)
+        # 2. ファイルを読み込む (Streamlitの環境によってstrかbytesかが変わる)
+        dxf_data = uploaded_file.read()
         
-        # 取得されたデータがbytes型であることを確認し、ezdxfに渡す
-        if isinstance(dxf_bytes, str):
-            # 万が一strとして読み込まれた場合、バイト列にエンコードし直す (通常は不要だが安全策として)
-            dxf_bytes = dxf_bytes.encode('utf-8') 
+        # 3. データが文字列(str)であれば、bytesに変換する (エラー対策)
+        if isinstance(dxf_data, str):
+            dxf_bytes = dxf_data.encode('utf-8') 
+        else:
+            dxf_bytes = dxf_data
             
+        # 4. ezdxf でバイナリデータとして読み込み
         doc = ezdxf.read(BytesIO(dxf_bytes))
         msp = doc.modelspace()
         
@@ -151,7 +154,6 @@ def dxf_to_shapely_polygon(uploaded_file):
                     try:
                         polylines.append(Polygon(coords))
                     except Exception:
-                        # st.warning の代わりに、単にスキップ
                         pass
                 else:
                     pass 
@@ -168,7 +170,7 @@ def dxf_to_shapely_polygon(uploaded_file):
     except ezdxf.DXFStructureError as e:
         return None, f"DXFファイルの構造エラーです: {e}"
     except Exception as e:
-        # 最終的なエラーメッセージをそのまま返す
+        # 予期せぬエラーが発生した場合
         return None, f"ファイルの読み込み中に予期せぬエラーが発生しました: {e}"
 
 # --- Streamlit アプリケーション ---
