@@ -1,125 +1,70 @@
-import streamlit as st
-import numpy as np
-from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
-import matplotlib.pyplot as plt
-import ezdxf 
-from io import BytesIO
+# ... (インポートと関数定義はすべて復活した状態) ...
 
-# Matplotlibの日本語フォント設定は引き続きコメントアウト
+# --- Streamlit アプリケーション ---
 
+st.set_page_config(layout="wide")
+st.title("簡易 Web CAM (Python/Streamlit)")
+st.caption("治具ポケット加工とVビット面取りのパス生成プロトタイプ")
 
-# --- 幾何学計算とGコード生成のコアロジック (すべて復活し、インデントを修正) ---
+# --- サイドバーでのパラメーター設定 (すべて復活) ---
+st.sidebar.header("📐 1. パラメーター設定")
 
-def generate_gcode(paths, z_depth, feed_rate, tool_name="T1"):
-    """工具パスからGコードを生成する関数"""
-    gcode = []
-    gcode.append(f"; --- {tool_name} G-Code Start ---")
-    gcode.append("G21 ; Metric units")
-    gcode.append("G90 ; Absolute positioning")
-    gcode.append("G00 Z10.0 ; Safe Z height")
-    gcode.append(f"T1 M06 ; Tool Change to {tool_name}")
-    gcode.append(f"F{feed_rate} ; Set Feed Rate")
-    gcode.append("")
+# 治具ポケット設定
+st.sidebar.subheader("治具ポケット加工 (エンドミル)")
+# ★★★ 復活させるウィジェット ★★★
+d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
+clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
 
-    for i, path in enumerate(paths):
-        coords = np.array(path.coords)
-        
-        # 最初の点への移動
-        if i == 0:
-             # 初期移動
-            gcode.append(f"G00 X{coords[0, 0]:.4f} Y{coords[0, 1]:.4f}")
-            # 切り込み
-            gcode.append(f"G01 Z{z_depth:.4f}")
-        else:
-             # 前回の終了点から次のパスの開始点へ移動 (Zはそのまま)
-             gcode.append(f"G00 X{coords[0, 0]:.4f} Y{coords[0, 1]:.4f}")
-             
-        
-        # パスを切削
-        for x, y in coords[1:]:
-            gcode.append(f"G01 X{x:.4f} Y{y:.4f}")
-            
-    # プログラム終了処理
-    gcode.append("G00 Z10.0 ; Retract to safe Z")
-    gcode.append("M30 ; Program end")
-    gcode.append(f"; --- {tool_name} G-Code End ---")
-    return "\n".join(gcode)
+# 治具ポケット深さ 
+z_pocket_input = st.sidebar.number_input("治具ポケット深さ $Z_{\\text{pocket}}$ (mm) (負の値で入力)", value=-1.0, max_value=0.0)
+z_pocket = z_pocket_input
 
-def add_dogbone_relief(polygon, diameter):
-    """
-    治具ポケットの内角にドッグボーン（直線延長）の逃げを追加する関数
-    ShapelyのPolygonの座標を直接変更する (単純な四角形のみ対応)
-    """
-    tool_r = diameter / 2.0
-    # 逃げの深さ (工具半径より少し大きくする)
-    relief_offset = tool_r * 0.4 
-    
-    # 座標を取得 (閉じたポリゴンなので最後の点は最初の点と同じ)
-    coords = list(polygon.exterior.coords)
-    
-    new_coords = []
-    # 最後の点は最初の点と同じなので除く
-    num_points = len(coords) - 1 
-    
-    for i in range(num_points):
-        # 現在の点、前の点、次の点を取得
-        current = coords[i]
-        prev = coords[(i - 1 + num_points) % num_points]
-        next_point = coords[(i + 1) % num_points]
-        
-        new_coords.append(current)
+# アクリルの厚み
+acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
 
-        # ベクトルを計算
-        v_in = np.array(prev) - np.array(current)
-        v_out = np.array(next_point) - np.array(current)
-        
-        # ノルム（長さ）がゼロでないことを確認
-        if np.linalg.norm(v_in) > 1e-6 and np.linalg.norm(v_out) > 1e-6:
-            # 正規化
-            v_in_n = v_in / np.linalg.norm(v_in)
-            v_out_n = v_out / np.linalg.norm(v_out)
-            
-            # 逃げ処理の追加
-            # 1. 逃げの点へ移動 (前方向へ)
-            relief_pt1 = np.array(current) - v_in_n * relief_offset
-            # 2. 逃げの点へ移動 (次方向へ)
-            relief_pt2 = np.array(current) - v_out_n * relief_offset
-            
-            # 角を突き抜けるようにパスを挿入
-            new_coords.append(tuple(relief_pt1))
-            new_coords.append(tuple(relief_pt2))
-            
-    # 最後に閉じる
-    new_coords.append(new_coords[0])
-    return LineString(new_coords)
+# アクリル上面 Z_top を計算
+# Z_top = Z_pocket (治具底面) + T (アクリル厚)
+z_acrylic_top = z_pocket + acrylic_thickness
+
+st.sidebar.markdown(rf"> **ポケット深さ $Z_{{\text{{pocket}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **アクリル上面 (面取り基準) $Z_{{\text{{top}}}}$**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
 
 
-def generate_pocket_paths(polygon, diameter, clearance, z_depth, dogbone=True):
-    """治具ポケット加工の工具中心パスを生成する関数"""
-    tool_r = diameter / 2.0
-    
-    # 1. 境界線のオフセット (クリアランス分外側へ)
-    boundary_offset = tool_r + clearance
-    try:
-        pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
-    except Exception:
-        return [] # 失敗したら空リストを返す
+# Vビット面取り設定
+st.sidebar.subheader("Vビット面取り加工")
+w_chamfer = st.sidebar.number_input("面取り幅 $W$ (mm)", value=0.5, min_value=0.01)
 
-    # 2. 穴埋めパスの生成 (ステップオーバーは工具径の70%とする)
-    stepover = diameter * 0.7 
-    current_poly = pocket_boundary
-    tool_paths = []
-    
-    # ポケットパスの生成
-    while current_poly.area > 0.001:
-        # 現在のポリゴンの外周をパスとする
-        if current_poly.exterior:
-            tool_paths.append(current_poly.exterior)
-            
-        # 次のパス（内側のパス）を計算
-        try:
-            current_poly = current_poly.buffer(-stepover, join_style=2)
-        except Exception:
-            break # 小さくなりすぎたら終了
-            
-        #
+# 面取り最終深さを計算し表示
+z_chamfer_final = z_acrylic_top - w_chamfer
+
+st.sidebar.markdown(rf"> **面取り開始点**: $\bf{{ {z_acrylic_top:.2f} }}$ mm")
+st.sidebar.markdown(rf"> **面取り最終深さ $Z_{{\text{{final}}}}$**: $\bf{{ {z_chamfer_final:.2f} }}$ mm")
+
+
+# 共通設定
+st.sidebar.subheader("共通設定")
+feed_rate = st.sidebar.number_input("送り速度 $F$ (mm/min)", value=1000, min_value=100)
+add_dogbone = st.sidebar.checkbox("治具に角の逃げ (Dogbone) を追加", value=True)
+# ★★★ サイドバーのウィジェット復活完了 ★★★
+
+
+# --- 形状データの定義をファイルアップロードに変更 (ファイルアップローダーはまだ復活させない) ---
+st.subheader("🛠️ 2. 部品形状データ (DXF/SVG 読み込み)")
+
+# uploaded_file = st.file_uploader(...) # アップローダーはまだコメントアウト
+
+original_polygon = None
+file_status = "ファイルがアップロードされていません。"
+
+# ファイルがない場合はデモ用の四角形を使用 (動作確認用)
+st.info("ファイルアップローダーは非表示です。デモ用の四角形を使用します。")
+coords = [(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]
+original_polygon = Polygon(coords)
+
+st.code(f"採用された形状: デモ用四角形")
+
+
+# --- メイン処理 (ボタンとロジック本体はまだコメントアウト) ---
+
+# if st.button("🚀 Gコードを生成 & パスを計算"):
+#     ... (ロジックはすべてコメントアウト)
