@@ -1,42 +1,30 @@
 import streamlit as st
-import matplotlib.pyplot as plt
 import numpy as np
-# 以下のライブラリはアプリの起動後にエラーを引き起こす可能性があるため、コメントアウトを継続します。
-# from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
-# import ezdxf 
-# from io import BytesIO
+import matplotlib.pyplot as plt
 
+# ★★★ 復活させるインポート ★★★
+from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
+import ezdxf 
+from io import BytesIO
+# ★★★ 復活させるインポート終わり ★★★
 
 # --- 幾何学計算とGコード生成のコアロジック ---
-# ... (全てコメントアウトするか、削除してください)
-# def generate_gcode(...):
-# ...
-
-# def add_dogbone_relief(...):
-# ...
-
-# def generate_pocket_paths(...):
-# ...
-
-# def generate_chamfer_paths(...):
-# ...
-
-# def dxf_to_shapely_polygon(...):
+# すべての関数定義は一旦コメントアウトしたままにします。
 # ...
 
 # --- Streamlit アプリケーション ---
 
-# ★★★ 修正箇所: ここから下だけを有効にします ★★★
 st.set_page_config(layout="wide")
 
-st.title("✅ 簡易 Web CAM (起動テスト成功)")
-st.success("この画面が見えていれば、アプリケーションの基本起動は成功しています。")
+st.title("✅ 簡易 Web CAM (ステップ 2: インポートテスト)")
+st.info("この画面が見えていれば、全てのライブラリインポートは成功しています。")
 st.sidebar.header("📐 1. パラメーター設定")
 
-# 起動確認のために、すべての複雑なロジックを一時的にコメントアウトします。
-# st.sidebar.subheader("治具ポケット加工 (エンドミル)")
-# d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
-# ...
+# 以前のUIパーツの一部だけを、変数を定義せずに表示します。
+st.sidebar.subheader("治具ポケット加工 (エンドミル)")
+st.sidebar.markdown("> **Z軸計算**")
+st.sidebar.subheader("Vビット面取り加工")
+
+# メイン処理ボタンも一旦コメントアウト
 # if st.button("🚀 Gコードを生成 & パスを計算"):
-# ...
-# ★★★ 修正完了 ★★★
+#     pass
