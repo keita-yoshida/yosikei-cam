@@ -1,4 +1,35 @@
-# ... (インポートと関数定義はすべて復活した状態) ...
+# ★★★ 修正箇所: 必要なインポートをすべて追加 ★★★
+import streamlit as st
+import numpy as np
+from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
+import matplotlib.pyplot as plt
+import ezdxf 
+from io import BytesIO
+# ★★★ 修正完了 ★★★
+
+# Matplotlibの日本語フォント設定は引き続きコメントアウト
+# ...
+
+# --- 幾何学計算とGコード生成のコアロジック (すべて復活) ---
+def generate_gcode(paths, z_depth, feed_rate, tool_name="T1"):
+# ... (generate_gcode 関数の全文) ...
+    return "\n".join(gcode)
+
+def add_dogbone_relief(polygon, diameter):
+# ... (add_dogbone_relief 関数の全文) ...
+    return LineString(new_coords)
+
+def generate_pocket_paths(polygon, diameter, clearance, z_depth, dogbone=True):
+# ... (generate_pocket_paths 関数の全文) ...
+    return tool_paths
+
+def generate_chamfer_paths(polygon, chamfer_width, z_start):
+# ... (generate_chamfer_paths 関数の全文) ...
+    return [chamfer_path], z_final
+
+def dxf_to_shapely_polygon(uploaded_file):
+# ... (dxf_to_shapely_polygon 関数の全文) ...
+    # return の前に st.warning を含む行があるため、st が必要
 
 # --- Streamlit アプリケーション ---
 
@@ -11,11 +42,10 @@ st.sidebar.header("📐 1. パラメーター設定")
 
 # 治具ポケット設定
 st.sidebar.subheader("治具ポケット加工 (エンドミル)")
-# ★★★ 復活させるウィジェット ★★★
 d_em = st.sidebar.number_input("エンドミル工具径 $D_{\\text{EM}}$ (mm)", value=6.0, min_value=0.1)
 clearance = st.sidebar.number_input("クリアランス $C$ (mm)", value=0.1, min_value=0.0)
 
-# 治具ポケット深さ 
+# 治具ポケット深さ
 z_pocket_input = st.sidebar.number_input("治具ポケット深さ $Z_{\\text{pocket}}$ (mm) (負の値で入力)", value=-1.0, max_value=0.0)
 z_pocket = z_pocket_input
 
@@ -23,7 +53,6 @@ z_pocket = z_pocket_input
 acrylic_thickness = st.sidebar.number_input("嵌めるアクリルの厚み $T$ (mm)", value=3.0, min_value=0.1)
 
 # アクリル上面 Z_top を計算
-# Z_top = Z_pocket (治具底面) + T (アクリル厚)
 z_acrylic_top = z_pocket + acrylic_thickness
 
 st.sidebar.markdown(rf"> **ポケット深さ $Z_{{\text{{pocket}}}}$**: $\bf{{ {z_pocket:.2f} }}$ mm")
@@ -45,13 +74,12 @@ st.sidebar.markdown(rf"> **面取り最終深さ $Z_{{\text{{final}}}}$**: $\bf{
 st.sidebar.subheader("共通設定")
 feed_rate = st.sidebar.number_input("送り速度 $F$ (mm/min)", value=1000, min_value=100)
 add_dogbone = st.sidebar.checkbox("治具に角の逃げ (Dogbone) を追加", value=True)
-# ★★★ サイドバーのウィジェット復活完了 ★★★
 
 
 # --- 形状データの定義をファイルアップロードに変更 (ファイルアップローダーはまだ復活させない) ---
 st.subheader("🛠️ 2. 部品形状データ (DXF/SVG 読み込み)")
 
-# uploaded_file = st.file_uploader(...) # アップローダーはまだコメントアウト
+uploaded_file = None # ファイルアップロードのシミュレーション
 
 original_polygon = None
 file_status = "ファイルがアップロードされていません。"
@@ -66,5 +94,7 @@ st.code(f"採用された形状: デモ用四角形")
 
 # --- メイン処理 (ボタンとロジック本体はまだコメントアウト) ---
 
-# if st.button("🚀 Gコードを生成 & パスを計算"):
-#     ... (ロジックはすべてコメントアウト)
+if st.button("🚀 Gコードを生成 & パスを計算"):
+    st.write("ボタンが押されましたが、加工ロジックはまだテスト中です。")
+
+# ... (アプリケーションの残りの部分はコメントアウトしたまま)
