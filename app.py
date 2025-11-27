@@ -1,30 +1,20 @@
-# ★★★ 必要なインポートをすべて追加 ★★★
 import streamlit as st
 import numpy as np
 from shapely.geometry import Polygon, LineString, mapping, MultiPolygon
 import matplotlib.pyplot as plt
 import ezdxf 
 from io import BytesIO
-# ★★★ 修正完了 ★★★
 
-# ... (generate_gcode, add_dogbone_relief, generate_pocket_paths, 
-# generate_chamfer_paths の各関数定義の全文 - 変更なし)
-
-def dxf_to_shapely_polygon(uploaded_file):
-    """DXFファイルを読み込み、Shapely Polygonに変換する (PLINE, LWPOLYLINE, LINEのみ対応)"""
-    # ... (dxf_to_shapely_polygon 関数の全文)
-    # ... (この関数の最後の行で関数本体は終了します)
-    return None, f"ファイルの読み込み中に予期せぬエラーが発生しました: {e}"
-
+# Matplotlibの日本語フォント設定は引き続きコメントアウト
+# ... (generate_gcode から dxf_to_shapely_polygon までのすべての関数定義の全文)
 
 # --- Streamlit アプリケーション ---
 
-# ★★★ 修正箇所: ここからインデントをリセットし、トップレベルに戻します ★★★
 st.set_page_config(layout="wide")
 st.title("簡易 Web CAM (Python/Streamlit)")
 st.caption("治具ポケット加工とVビット面取りのパス生成プロトタイプ")
 
-# --- サイドバーでのパラメーター設定 (すべて復活) ---
+# サイドバーでのパラメーター設定
 st.sidebar.header("📐 1. パラメーター設定")
 
 # 治具ポケット設定
@@ -63,9 +53,21 @@ feed_rate = st.sidebar.number_input("送り速度 $F$ (mm/min)", value=1000, min
 add_dogbone = st.sidebar.checkbox("治具に角の逃げ (Dogbone) を追加", value=True)
 
 
-# --- 形状データの定義をファイルアップロードに変更 (ファイルアップローダーはまだ復活させない) ---
+# --- 形状データの定義 (ファイルアップローダーはまだコメントアウト) ---
 st.subheader("🛠️ 2. 部品形状データ (DXF/SVG 読み込み)")
 
-uploaded_file = None # ファイルアップロードのシミュレーション
+uploaded_file = None 
 
-original
+# original_polygon はここで定義
+original_polygon = None
+file_status = "ファイルがアップロードされていません。"
+
+# ファイルがない場合はデモ用の四角形を使用 (動作確認用)
+st.info("ファイルアップローダーは非表示です。デモ用の四角形を使用します。")
+coords = [(0, 0), (100, 0), (100, 50), (0, 50), (0, 0)]
+original_polygon = Polygon(coords) # ★★★ 変数 original_polygon を正しく定義 ★★★
+
+st.code(f"採用された形状: デモ用四角形")
+
+
+# --- メイン処理 (すべて復活させ、 NameError を修正)
