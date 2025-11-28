@@ -141,18 +141,22 @@ def add_dogbone_relief(polygon: Polygon, diameter: float) -> LineString:
     return LineString(new_coords)
 
 
-def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, stepover_ratio: float = 0.7, dogbone: bool = True) -> list[LineString]:
+def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, stepover_ratio: float, dogbone: bool = True) -> list[LineString]:
     """治具ポケット加工パス生成"""
     tool_r = diameter / 2.0
     
-    # 1. 境界オフセット (外側へ)
+    # 1. 境界オフセット (目標壁位置 - 工具半径)
+    # これにより、仕上がり寸法 = 元図形 + クリアランス となります
+    boundary_offset = clearance - tool_r
+    
     try:
-        pocket_boundary = polygon.buffer(tool_r + clearance, join_style=2)
+        pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
     except Exception:
         return [] 
     
     # 2. 内部切削パスの生成
     stepover = diameter * stepover_ratio 
+    
     current_poly = pocket_boundary
     tool_paths = []
     
@@ -173,7 +177,7 @@ def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, s
         if current_poly.geom_type != 'Polygon':
              break
              
-    # 3. ドッグボーン追加 (最外周のみ)
+    # 3. ドッグボーン追加
     if dogbone and tool_paths:
         try:
             tool_paths[0] = add_dogbone_relief(Polygon(tool_paths[0]), diameter)
@@ -183,13 +187,20 @@ def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, s
     return [LineString(p.coords) for p in tool_paths if p.geom_type in ('LineString', 'LinearRing')]
 
 
-def generate_chamfer_paths(polygon: Polygon, chamfer_width: float) -> list[LineString]:
+def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: float = 0.0) -> list[LineString]:
     """Vビット面取りパス生成"""
     if chamfer_width <= 0:
         return []
+    
+    # 面取りパスのオフセット量 = 刃先オフセットのみ
+    total_offset = tip_offset
+    
     try:
-        # 面取り幅分だけ外側へオフセット
-        chamfer_path_poly = polygon.buffer(chamfer_width, join_style=1) 
+        # 外側へオフセット (join_style=1:roundで丸める)
+        if total_offset > 0:
+            chamfer_path_poly = polygon.buffer(total_offset, join_style=1)
+        else:
+            chamfer_path_poly = polygon
     except Exception:
         return []
         
@@ -246,14 +257,26 @@ st.set_page_config(page_title="Simple CAM", layout="wide")
 st.title("🛠️ 簡易 CNC Gコードジェネレーター")
 st.caption("DXFから治具ポケットと面取り加工のGコードを生成します")
 
-# サイドバー: パラメーター入力
 with st.sidebar:
     st.header("⚙️ 加工設定")
     
     st.subheader("エンドミル (ポケット加工)")
     tool_diameter = st.number_input("工具径 (mm)", value=3.0, step=0.1, format="%.1f")
-    clearance = st.number_input("クリアランス (mm)", value=0.5, step=0.1, format="%.1f", help="治具と製品の隙間")
-    pocket_depth = st.number_input("ポケット深さ (mm)", value=-5.0, step=0.1, format="%.1f", help="Z0からの深さ (負の値)")
+    clearance = st.number_input("クリアランス (mm)", value=0.05, step=0.01, format="%.2f", help="治具と製品の隙間")
+    
+    # ★★★ 修正: 負の値で直接入力、プラス入力不可 ★★★
+    pocket_depth = st.number_input(
+        "ポケット深さ (mm)", 
+        value=-1.0, 
+        max_value=0.0, 
+        step=0.1, 
+        format="%.1f", 
+        help="Z0からの深さ (負の値で入力してください)"
+    )
+    
+    stepover_ratio = st.slider("ステップオーバー率 (%)", min_value=10, max_value=90, value=70, step=5, help="工具径に対する切り込み幅の割合") / 100.0
+    st.caption(f"実際のピッチ: {tool_diameter * stepover_ratio:.2f} mm")
+    
     add_dogbone = st.checkbox("ドッグボーン逃げを追加", value=True)
 
     st.divider()
@@ -262,21 +285,36 @@ with st.sidebar:
     acrylic_thickness = st.number_input("アクリル厚み (mm)", value=3.0, step=0.1, format="%.1f")
     chamfer_width = st.number_input("面取り幅 (mm)", value=0.5, step=0.1, format="%.1f")
     
-    # 計算値の表示
+    # 修正: 初期値1.0
+    tip_offset = st.number_input(
+        "刃先オフセット (mm)", 
+        value=1.0, 
+        step=0.1, 
+        format="%.1f", 
+        help="Vビットの先端を使わず、腹で切るために外側へずらす距離"
+    )
+    
+    if tip_offset < 0:
+        st.error("⚠️ 警告: 刃先オフセットがマイナスです。工具が内側に食い込み、意図しない形状になる可能性があります。")
+        # 警告のみで処理は止めない
+    
     z_chamfer_start = pocket_depth + acrylic_thickness
-    z_chamfer_final = z_chamfer_start - chamfer_width
-    st.info(f"面取り開始Z: {z_chamfer_start:.2f}mm\n\n切込深さZ: {z_chamfer_final:.2f}mm")
+    z_chamfer_final = z_chamfer_start - (chamfer_width + tip_offset)
+    
+    st.info(f"面取り開始Z: {z_chamfer_start:.2f}mm\n\n切込深さZ: {z_chamfer_final:.2f}mm\n\n(オフセット込み)")
+
+    # ★★★ 修正: 治具表面 (Z=0) 貫通の警告 ★★★
+    if z_chamfer_final < 0.0:
+        st.error(f"⚠️ 危険: 面取り工具の先端 (Z{z_chamfer_final:.2f}) が、治具の表面 (Z=0.0) よりも深くなっています！治具本体を削る可能性があります。")
 
     st.divider()
     feed_rate = st.number_input("送り速度 (mm/min)", value=300, step=10)
 
 
-# メインエリア: ファイルアップロードと処理
 st.header("1. DXFファイル入力")
 uploaded_file = st.file_uploader("DXFファイルをアップロード", type=["dxf"])
 
 if uploaded_file is not None:
-    # ファイル読み込みと解析
     file_bytes = uploaded_file.getvalue()
     main_polygon = dxf_to_shapely_polygon(file_bytes)
 
@@ -286,7 +324,6 @@ if uploaded_file is not None:
         with col1:
             st.success(f"解析成功: 面積 {main_polygon.area:.1f} mm²")
             
-            # 元図形のプレビュー
             fig, ax = plt.subplots(figsize=(5, 5))
             x, y = main_polygon.exterior.xy
             ax.plot(x, y, color='blue', label='Original')
@@ -294,21 +331,28 @@ if uploaded_file is not None:
             ax.grid(True, linestyle=':', alpha=0.6)
             st.pyplot(fig)
 
-        # パス計算とGコード生成
         with col2:
             st.header("2. 生成結果")
             
-            # パス生成
-            pocket_paths = generate_pocket_paths(main_polygon, tool_diameter, clearance, dogbone=add_dogbone)
+            pocket_paths = generate_pocket_paths(
+                main_polygon, 
+                diameter=tool_diameter, 
+                clearance=clearance, 
+                stepover_ratio=stepover_ratio, 
+                dogbone=add_dogbone
+            )
+            
             chamfer_paths = []
             if chamfer_width > 0:
-                chamfer_paths = generate_chamfer_paths(main_polygon, chamfer_width)
+                chamfer_paths = generate_chamfer_paths(
+                    main_polygon, 
+                    chamfer_width,
+                    tip_offset=tip_offset
+                )
             
-            # プロット用
             fig_path, ax_path = plt.subplots(figsize=(5, 5))
             ax_path.plot(x, y, color='gray', linestyle='--', alpha=0.5, label='Original')
             
-            # Gコード生成と描画
             gcode_pocket = None
             gcode_chamfer = None
 
@@ -332,7 +376,6 @@ if uploaded_file is not None:
             ax_path.grid(True, linestyle=':', alpha=0.6)
             st.pyplot(fig_path)
             
-            # --- 修正箇所: Gコードを別々にダウンロード ---
             st.subheader("Gコード ダウンロード")
             
             dl_col1, dl_col2 = st.columns(2)
@@ -367,3 +410,5 @@ if uploaded_file is not None:
 
     else:
         st.error("有効な図形が見つかりませんでした。")
+else:
+    st.info("DXFファイルをアップロードして開始してください。")
