@@ -7,6 +7,7 @@ from io import BytesIO
 
 # 幾何学計算ライブラリ
 from shapely.geometry import Polygon, LineString
+from shapely.affinity import translate
 import ezdxf
 import ezdxf.path
 
@@ -106,6 +107,24 @@ def dxf_to_shapely_polygon(dxf_content) -> Polygon | None:
             except Exception:
                 pass
 
+def align_polygon(polygon: Polygon, mode: str) -> Polygon:
+    """
+    指定されたモードに従ってポリゴンの位置を移動させる
+    """
+    minx, miny, maxx, maxy = polygon.bounds
+    width = maxx - minx
+    height = maxy - miny
+    
+    if mode == "Bottom-Left (左下)":
+        return translate(polygon, xoff=-minx, yoff=-miny)
+    elif mode == "Center (中心)":
+        center_x = minx + width / 2
+        center_y = miny + height / 2
+        return translate(polygon, xoff=-center_x, yoff=-center_y)
+    elif mode == "Original (DXF座標)":
+        return polygon
+    return polygon
+
 
 def add_dogbone_relief(polygon: Polygon, diameter: float) -> LineString:
     """ポケット内角にドッグボーン（直線延長）の逃げを追加"""
@@ -145,8 +164,7 @@ def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, s
     """治具ポケット加工パス生成"""
     tool_r = diameter / 2.0
     
-    # 1. 境界オフセット (目標壁位置 - 工具半径)
-    # これにより、仕上がり寸法 = 元図形 + クリアランス となります
+    # 境界オフセット (目標壁位置 - 工具半径)
     boundary_offset = clearance - tool_r
     
     try:
@@ -154,9 +172,7 @@ def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, s
     except Exception:
         return [] 
     
-    # 2. 内部切削パスの生成
     stepover = diameter * stepover_ratio 
-    
     current_poly = pocket_boundary
     tool_paths = []
     
@@ -177,7 +193,7 @@ def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, s
         if current_poly.geom_type != 'Polygon':
              break
              
-    # 3. ドッグボーン追加
+    # ドッグボーン追加
     if dogbone and tool_paths:
         try:
             tool_paths[0] = add_dogbone_relief(Polygon(tool_paths[0]), diameter)
@@ -192,11 +208,9 @@ def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: f
     if chamfer_width <= 0:
         return []
     
-    # 面取りパスのオフセット量 = 刃先オフセットのみ
     total_offset = tip_offset
     
     try:
-        # 外側へオフセット (join_style=1:roundで丸める)
         if total_offset > 0:
             chamfer_path_poly = polygon.buffer(total_offset, join_style=1)
         else:
@@ -215,17 +229,19 @@ def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: f
     return [LineString(p.coords) for p in paths]
 
 
-def generate_gcode(paths: list[LineString], z_start: float, z_final: float, feed_rate: float, tool_name: str) -> str:
+# ★★★ 修正箇所: カスタムヘッダー/フッターを受け取るように変更 ★★★
+def generate_gcode(paths: list[LineString], z_start: float, z_final: float, feed_rate: float, tool_name: str, header_code: str, footer_code: str) -> str:
     """パスリストからGコード文字列を生成"""
-    gcode = [
-        f"; --- {tool_name} Start ---",
-        "G21 ; Metric",
-        "G90 ; Absolute",
-        "G00 Z10.0 ; Safe Z",
-        f"T1 M06 ; Tool: {tool_name}",
-        f"F{int(feed_rate)}",
-        ""
-    ]
+    gcode = []
+    
+    # 1. ユーザー定義のスタートコード
+    gcode.append(header_code.strip())
+    
+    # 2. 自動挿入コード (工具定義と送り速度)
+    gcode.append(f"; --- Tool: {tool_name} ---")
+    gcode.append(f"T1 M06")
+    gcode.append(f"F{int(feed_rate)}")
+    gcode.append("")
     
     for path in paths:
         coords = np.array(path.coords)
@@ -243,11 +259,11 @@ def generate_gcode(paths: list[LineString], z_start: float, z_final: float, feed
         # リトラクト
         gcode.append("G00 Z10.0")
 
-    gcode.extend([
-        "",
-        "M30 ; End",
-        f"; --- {tool_name} End ---"
-    ])
+    gcode.append("")
+    
+    # 3. ユーザー定義のエンドコード
+    gcode.append(footer_code.strip())
+    
     return "\n".join(gcode)
 
 
@@ -258,26 +274,34 @@ st.title("🛠️ 簡易 CNC Gコードジェネレーター")
 st.caption("DXFから治具ポケットと面取り加工のGコードを生成します")
 
 with st.sidebar:
+    # --- 原点設定 ---
+    st.header("📍 原点設定")
+    origin_mode = st.radio(
+        "加工原点 (0,0) の位置",
+        ("Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"),
+        index=0
+    )
+    st.divider()
+
+    # --- 加工設定 ---
     st.header("⚙️ 加工設定")
     
     st.subheader("エンドミル (ポケット加工)")
     tool_diameter = st.number_input("工具径 (mm)", value=3.0, step=0.1, format="%.1f")
     clearance = st.number_input("クリアランス (mm)", value=0.05, step=0.01, format="%.2f", help="治具と製品の隙間")
     
-    # ★★★ 修正: 負の値で直接入力、プラス入力不可 ★★★
     pocket_depth = st.number_input(
         "ポケット深さ (mm)", 
         value=-1.0, 
         max_value=0.0, 
         step=0.1, 
         format="%.1f", 
-        help="Z0からの深さ (負の値で入力してください)"
+        help="Z0からの深さ (負の値で入力)"
     )
     
     stepover_ratio = st.slider("ステップオーバー率 (%)", min_value=10, max_value=90, value=70, step=5, help="工具径に対する切り込み幅の割合") / 100.0
-    st.caption(f"実際のピッチ: {tool_diameter * stepover_ratio:.2f} mm")
-    
     add_dogbone = st.checkbox("ドッグボーン逃げを追加", value=True)
+    feed_rate_pocket = st.number_input("ポケット送り速度 (mm/min)", value=300, step=10)
 
     st.divider()
 
@@ -285,7 +309,6 @@ with st.sidebar:
     acrylic_thickness = st.number_input("アクリル厚み (mm)", value=3.0, step=0.1, format="%.1f")
     chamfer_width = st.number_input("面取り幅 (mm)", value=0.5, step=0.1, format="%.1f")
     
-    # 修正: 初期値1.0
     tip_offset = st.number_input(
         "刃先オフセット (mm)", 
         value=1.0, 
@@ -296,19 +319,27 @@ with st.sidebar:
     
     if tip_offset < 0:
         st.error("⚠️ 警告: 刃先オフセットがマイナスです。工具が内側に食い込み、意図しない形状になる可能性があります。")
-        # 警告のみで処理は止めない
     
     z_chamfer_start = pocket_depth + acrylic_thickness
     z_chamfer_final = z_chamfer_start - (chamfer_width + tip_offset)
     
     st.info(f"面取り開始Z: {z_chamfer_start:.2f}mm\n\n切込深さZ: {z_chamfer_final:.2f}mm\n\n(オフセット込み)")
 
-    # ★★★ 修正: 治具表面 (Z=0) 貫通の警告 ★★★
     if z_chamfer_final < 0.0:
         st.error(f"⚠️ 危険: 面取り工具の先端 (Z{z_chamfer_final:.2f}) が、治具の表面 (Z=0.0) よりも深くなっています！治具本体を削る可能性があります。")
 
+    feed_rate_chamfer = st.number_input("面取り送り速度 (mm/min)", value=300, step=10)
+
     st.divider()
-    feed_rate = st.number_input("送り速度 (mm/min)", value=300, step=10)
+
+    # ★★★ 追加: Gコード設定（折りたたみ） ★★★
+    with st.expander("📝 Gコード設定 (スタート/エンド)"):
+        default_start_code = "G21 ; Metric\nG90 ; Absolute\nG00 Z10.0 ; Safe Z\nM3 S10000 ; Spindle On"
+        default_end_code = "M5 ; Spindle Off\nG00 Z10.0\nM30 ; Program End"
+        
+        st.caption("共通設定 (各ファイルの先頭/末尾に追加されます)")
+        start_code_input = st.text_area("スタートコード", value=default_start_code, height=100)
+        end_code_input = st.text_area("エンドコード", value=default_end_code, height=100)
 
 
 st.header("1. DXFファイル入力")
@@ -319,6 +350,8 @@ if uploaded_file is not None:
     main_polygon = dxf_to_shapely_polygon(file_bytes)
 
     if main_polygon:
+        main_polygon = align_polygon(main_polygon, origin_mode)
+
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -327,8 +360,12 @@ if uploaded_file is not None:
             fig, ax = plt.subplots(figsize=(5, 5))
             x, y = main_polygon.exterior.xy
             ax.plot(x, y, color='blue', label='Original')
+            ax.axhline(y=0, color='k', linewidth=0.8, linestyle='-')
+            ax.axvline(x=0, color='k', linewidth=0.8, linestyle='-')
+            ax.plot(0, 0, 'ro', label='Origin (0,0)')
             ax.set_aspect('equal')
             ax.grid(True, linestyle=':', alpha=0.6)
+            ax.legend()
             st.pyplot(fig)
 
         with col2:
@@ -352,6 +389,8 @@ if uploaded_file is not None:
             
             fig_path, ax_path = plt.subplots(figsize=(5, 5))
             ax_path.plot(x, y, color='gray', linestyle='--', alpha=0.5, label='Original')
+            ax_path.axhline(y=0, color='k', linewidth=0.8, linestyle='-')
+            ax_path.axvline(x=0, color='k', linewidth=0.8, linestyle='-')
             
             gcode_pocket = None
             gcode_chamfer = None
@@ -362,14 +401,32 @@ if uploaded_file is not None:
                     color = 'red' if idx == 0 else 'orange'
                     ax_path.plot(px, py, color=color, linewidth=1, label='Pocket' if idx == 0 else None)
                 
-                gcode_pocket = generate_gcode(pocket_paths, 0.0, pocket_depth, feed_rate, "Pocket_EM")
+                # ★★★ 修正: カスタムヘッダー/フッターを渡す ★★★
+                gcode_pocket = generate_gcode(
+                    pocket_paths, 
+                    0.0, 
+                    pocket_depth, 
+                    feed_rate_pocket, 
+                    "Pocket_EM",
+                    start_code_input,
+                    end_code_input
+                )
 
             if chamfer_paths:
                 for idx, path in enumerate(chamfer_paths):
                     px, py = path.xy
                     ax_path.plot(px, py, color='green', linewidth=1, label='Chamfer')
                 
-                gcode_chamfer = generate_gcode(chamfer_paths, z_chamfer_start, z_chamfer_final, feed_rate, "Chamfer_Bit")
+                # ★★★ 修正: カスタムヘッダー/フッターを渡す ★★★
+                gcode_chamfer = generate_gcode(
+                    chamfer_paths, 
+                    z_chamfer_start, 
+                    z_chamfer_final, 
+                    feed_rate_chamfer, 
+                    "Chamfer_Bit",
+                    start_code_input,
+                    end_code_input
+                )
 
             ax_path.set_aspect('equal')
             ax_path.legend()
