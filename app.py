@@ -6,13 +6,13 @@ import os
 from io import BytesIO
 
 # 幾何学計算ライブラリ
-from shapely.geometry import Polygon, LineString
-from shapely.affinity import translate
+from shapely.geometry import Polygon, LineString, MultiLineString, Point
+from shapely.ops import translate, linemerge
 import ezdxf
 import ezdxf.path
+
 # Vカービング用
 from scipy.spatial import Voronoi
-from shapely.geometry import Point
 
 # --- 0. ポストプロセッサ定義 ---
 POST_PROCESSORS = {
@@ -42,7 +42,71 @@ POST_PROCESSORS = {
     }
 }
 
-# --- 1. コアロジック機能 ---
+# --- 1. F-Engrave 由来のアルゴリズム (移植) ---
+
+def dist_lseg(l1, l2, p, z_only=False):
+    """
+    点 p と、線分 l1-l2 との距離を計算する (3D対応)
+    F-Engraveのソースより移植
+    """
+    x0, y0, z0 = l1
+    xa, ya, za = l2
+    xi, yi, zi = p
+    
+    dx = xa-x0
+    dy = ya-y0
+    dz = za-z0
+    d2 = dx*dx + dy*dy + dz*dz
+
+    if d2 == 0: return 0
+
+    t = (dx * (xi-x0) + dy * (yi-y0) + dz * (zi-z0)) / d2
+    if t < 0: t = 0
+    if t > 1: t = 1
+    
+    if (z_only==True):
+        dist2 = (zi - z0 - t*dz)**2
+    else:
+        dist2 = (xi - x0 - t*dx)**2 + (yi - y0 - t*dy)**2 + (zi - z0 - t*dz)**2
+
+    return dist2 ** .5
+
+def douglas_peucker(st_points, tolerance=.001):
+    """
+    Douglas-Peucker アルゴリズムによるパスの間引き（スムージング）
+    F-Engraveの 'douglas' 関数をベースにPython3/Generator向けに調整
+    Input: [(x,y,z), (x,y,z), ...]
+    Output: 間引きされたリスト
+    """
+    if len(st_points) < 3:
+        return st_points
+
+    l1 = st_points[0]
+    l2 = st_points[-1]
+    
+    # 始点と終点が同じ場合の無限ループ回避
+    if (abs(l1[0]-l2[0]) < 1e-5) and (abs(l1[1]-l2[1]) < 1e-5) and (abs(l1[2]-l2[2]) < 1e-5):
+       return st_points # 閉じたループの端点処理は簡易的にそのまま返す
+
+    worst_dist = 0
+    worst = 0
+    
+    for i, p in enumerate(st_points):
+        if i == 0 or i == len(st_points)-1: continue
+        dist = dist_lseg(l1, l2, p)
+        if dist > worst_dist:
+            worst = i
+            worst_dist = dist
+            
+    if worst_dist > tolerance:
+        # 分割して再帰
+        left = douglas_peucker(st_points[:worst+1], tolerance)
+        right = douglas_peucker(st_points[worst:], tolerance)
+        return left[:-1] + right
+    else:
+        return [l1, l2]
+
+# --- 2. コアロジック機能 ---
 
 def dxf_to_shapely_polygon(dxf_content) -> Polygon | None:
     tmp_file_path = None
@@ -85,7 +149,9 @@ def dxf_to_shapely_polygon(dxf_content) -> Polygon | None:
                             fixed_poly = poly.buffer(0)
                             if fixed_poly.is_valid and fixed_poly.area > 1e-6:
                                 if fixed_poly.geom_type == 'Polygon': polygons.append(fixed_poly)
-                                elif fixed_poly.geom_type == 'MultiPolygon': polygons.append(max(fixed_poly.geoms, key=lambda g: g.area))
+                                elif fixed_poly.geom_type == 'MultiPolygon': 
+                                    for g in fixed_poly.geoms:
+                                        if g.area > 1e-6: polygons.append(g)
                 except Exception: continue
         
         if not polygons: return None
@@ -131,54 +197,28 @@ def add_dogbone_relief(polygon: Polygon, diameter: float) -> LineString:
     new_coords.append(new_coords[0])
     return LineString(new_coords)
 
-# ★★★ 修正: MultiPolygon対応版ポケット加工生成 ★★★
 def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, stepover_ratio: float, dogbone: bool = True) -> list[LineString]:
-    """治具ポケット加工パス生成 (MultiPolygon対応)"""
     tool_r = diameter / 2.0
     boundary_offset = clearance - tool_r
-    
-    try:
-        # 初期オフセット (ここでMultiPolygonになる可能性がある)
-        pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
-    except Exception:
-        return [] 
-    
+    try: pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
+    except Exception: return [] 
     stepover = diameter * stepover_ratio 
     current_geom = pocket_boundary
     tool_paths = []
-    
-    # 面積がある限りループ
     while current_geom and not current_geom.is_empty and current_geom.area > 1e-6:
-        # 現在の形状からパス(外形線)を抽出
         if current_geom.geom_type == 'Polygon':
             tool_paths.append(current_geom.exterior)
-            # 中抜き(島)がある場合はその境界もパスに追加
-            for interior in current_geom.interiors:
-                tool_paths.append(interior)
-                
+            for interior in current_geom.interiors: tool_paths.append(interior)
         elif current_geom.geom_type == 'MultiPolygon':
-            # 分離した全ての島について処理
             for poly in current_geom.geoms:
                 tool_paths.append(poly.exterior)
-                for interior in poly.interiors:
-                    tool_paths.append(interior)
-        
-        # 次のステップへ内側にオフセット
-        try:
-            current_geom = current_geom.buffer(-stepover, join_style=2)
-        except Exception:
-            break 
-            
-    # ドッグボーン追加 (最初のパスのみ適用してクラッシュ回避)
+                for interior in poly.interiors: tool_paths.append(interior)
+        try: current_geom = current_geom.buffer(-stepover, join_style=2)
+        except Exception: break 
     if dogbone and tool_paths:
         try:
-            first_path = tool_paths[0]
-            # パスが閉じているか確認してPolygon化
-            if first_path.is_closed:
-                tool_paths[0] = add_dogbone_relief(Polygon(first_path), diameter)
-        except Exception:
-             pass 
-             
+            if tool_paths[0].is_closed: tool_paths[0] = add_dogbone_relief(Polygon(tool_paths[0]), diameter)
+        except Exception: pass 
     return [LineString(p.coords) for p in tool_paths if p.geom_type in ('LineString', 'LinearRing')]
 
 def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: float = 0.0) -> list[LineString]:
@@ -195,19 +235,26 @@ def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: f
              if g.geom_type == 'Polygon': paths.append(g.exterior)
     return [LineString(p.coords) for p in paths]
 
-def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: float, step_length: float = 0.1) -> list:
+# ★★★ 改良版 Vカービング生成ロジック (LineMerge + Douglas-Peucker) ★★★
+def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: float, step_length: float = 0.05) -> list:
+    """
+    Vカービング用の3D連続パスを生成する
+    """
     boundary_line = polygon.exterior
     length = boundary_line.length
+    # サンプリング密度を上げて詳細度アップ
     num_points = int(length / step_length)
-    if num_points < 10: num_points = 10
+    if num_points < 20: num_points = 20
     
+    # 1. 境界点のサンプリング
     sample_points = [boundary_line.interpolate(i * step_length) for i in range(num_points)]
     coords = np.array([(p.x, p.y) for p in sample_points])
     
+    # 2. ボロノイ図の計算
     vor = Voronoi(coords)
-    medial_axis_segments = []
-    tool_angle_rad = np.radians(tool_angle_deg)
     
+    # 3. 内部の骨格（Medial Axis）となる「線分」を抽出
+    raw_segments = []
     for p1_idx, p2_idx in vor.ridge_vertices:
         if p1_idx == -1 or p2_idx == -1: continue
         p1 = vor.vertices[p1_idx]
@@ -215,17 +262,46 @@ def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: fl
         pt1 = Point(p1)
         pt2 = Point(p2)
         
+        # ポリゴン内部にある線分のみ採用
         if polygon.contains(pt1) and polygon.contains(pt2):
-            dist1 = boundary_line.distance(pt1)
-            dist2 = boundary_line.distance(pt2)
-            tan_half_angle = np.tan(tool_angle_rad / 2.0)
-            z1 = - (dist1 / tan_half_angle)
-            z2 = - (dist2 / tan_half_angle)
-            z1 = max(z1, max_depth)
-            z2 = max(z2, max_depth)
+            raw_segments.append(LineString([p1, p2]))
             
-            medial_axis_segments.append([(p1[0], p1[1], z1), (p2[0], p2[1], z2)])
-    return medial_axis_segments
+    # 4. 線分を結合して「一筆書き」に近い長いパスにする (Line Merge)
+    # これにより G0 (空移動) が激減し、きれいなデータになる
+    merged_lines = linemerge(raw_segments)
+    
+    final_3d_paths = []
+    tool_angle_rad = np.radians(tool_angle_deg)
+    tan_half_angle = np.tan(tool_angle_rad / 2.0)
+    
+    # MultiLineString または LineString が返ってくる
+    if merged_lines.geom_type == 'LineString':
+        lines_to_process = [merged_lines]
+    elif merged_lines.geom_type == 'MultiLineString':
+        lines_to_process = list(merged_lines.geoms)
+    else:
+        lines_to_process = []
+
+    # 5. 各パスに対してZ高さを計算し、Douglas-Peuckerで間引き
+    for line in lines_to_process:
+        # パス上の点を細かく取得 (Z計算用)
+        # ※LineMergeされた線は荒い場合があるので、再度細分化してからZを計算
+        pts_on_line = [line.interpolate(i * step_length) for i in range(int(line.length/step_length) + 1)]
+        
+        path_3d_points = []
+        for pt in pts_on_line:
+            dist = boundary_line.distance(pt)
+            z = - (dist / tan_half_angle)
+            z = max(z, max_depth) # 最大深さ制限
+            path_3d_points.append((pt.x, pt.y, z))
+            
+        # ★ F-Engrave由来のアルゴリズムでデータをきれいに間引く ★
+        simplified_3d_path = douglas_peucker(path_3d_points, tolerance=0.01) # 許容誤差 0.01mm
+        
+        if len(simplified_3d_path) > 1:
+            final_3d_paths.append(simplified_3d_path)
+            
+    return final_3d_paths
 
 def generate_gcode(paths: list, z_start: float, z_final: float, feed_rate: float, tool_name: str, header_code: str, footer_code: str, format_type: str = "G00/G01", is_3d: bool = False) -> str:
     gcode = []
@@ -239,14 +315,22 @@ def generate_gcode(paths: list, z_start: float, z_final: float, feed_rate: float
     gcode.append("")
     
     if is_3d:
+        # Vカービング用 (連続した3Dパス)
         safe_z = 5.0 
-        for segment in paths:
-            p1, p2 = segment
-            gcode.append(f"{CMD_G0} X{p1[0]:.3f} Y{p1[1]:.3f}")
-            gcode.append(f"{CMD_G1} Z{p1[2]:.3f}")
-            gcode.append(f"{CMD_G1} X{p2[0]:.3f} Y{p2[1]:.3f} Z{p2[2]:.3f}")
+        for path_points in paths:
+            # 始点へ移動
+            p_start = path_points[0]
+            gcode.append(f"{CMD_G0} X{p_start[0]:.3f} Y{p_start[1]:.3f}")
+            gcode.append(f"{CMD_G1} Z{p_start[2]:.3f}") # 始点の深さへ
+            
+            # パスをたどる
+            for p in path_points[1:]:
+                gcode.append(f"{CMD_G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
+            
+            # リトラクト (パス終了)
             gcode.append(f"{CMD_G0} Z{safe_z}")
     else:
+        # 通常の2Dパス
         for path in paths:
             coords = np.array(path.coords)
             if len(coords) < 1: continue
@@ -290,14 +374,10 @@ with st.sidebar:
         st.subheader("Vビット (面取り)")
         chamfer_width = st.number_input("面取り幅 (mm)", value=0.5, step=0.1, format="%.1f")
         tip_offset = st.number_input("刃先オフセット (mm)", value=1.0, step=0.1, format="%.1f")
-        z_chamfer_depth = -1.0 
         if tip_offset < 0: st.error("⚠️ 警告: 刃先オフセットがマイナスです")
-        
-        # 面取り深さ計算
         z_chamfer_final = - (chamfer_width + tip_offset)
         if z_chamfer_final < 0:
-             if z_chamfer_final < -5.0: 
-                 st.warning(f"面取り深さ Z{z_chamfer_final:.2f} が深すぎる可能性があります")
+             if z_chamfer_final < -5.0: st.warning(f"面取り深さ Z{z_chamfer_final:.2f} が深すぎる可能性があります")
         feed_rate_chamfer = st.number_input("送り速度 (mm/min)", value=300, step=10, key="feed_chamfer")
 
     with tab3:
@@ -342,17 +422,18 @@ if uploaded_file is not None:
         with col2:
             st.header("2. 生成結果")
             
-            # 1. ポケット
+            # ポケット
             pocket_paths = generate_pocket_paths(main_polygon, tool_diameter, clearance, stepover_ratio, add_dogbone)
             
-            # 2. 面取り
+            # 面取り
             z_chamfer_final = - (chamfer_width + tip_offset)
             chamfer_paths = generate_chamfer_paths(main_polygon, chamfer_width, tip_offset)
 
-            # 3. Vカービング
+            # Vカービング (計算ロジック刷新)
             vcarve_paths = []
-            if tab3:
-                vcarve_paths = generate_vcarve_paths(main_polygon, v_tool_angle, v_max_depth)
+            if tab3: # Vカーブ用の計算
+                with st.spinner("Vカービングパス計算中..."):
+                    vcarve_paths = generate_vcarve_paths(main_polygon, v_tool_angle, v_max_depth)
 
             # プロット
             fig_path, ax_path = plt.subplots(figsize=(5, 5))
@@ -373,9 +454,13 @@ if uploaded_file is not None:
                 gcode_chamfer = generate_gcode(chamfer_paths, 0.0, z_chamfer_final, feed_rate_chamfer, "Chamfer_Bit", start_code_input, end_code_input, machine_config["format"])
 
             if vcarve_paths:
-                for seg in vcarve_paths:
-                    p1, p2 = seg
-                    ax_path.plot([p1[0], p2[0]], [p1[1], p2[1]], color='red', linewidth=0.5)
+                # Vカーブ (3Dパス) の描画
+                for path_pts in vcarve_paths:
+                    # 2D平面への投影 (X, Y) だけ取り出して描画
+                    xs = [p[0] for p in path_pts]
+                    ys = [p[1] for p in path_pts]
+                    ax_path.plot(xs, ys, color='red', linewidth=0.8)
+                
                 gcode_vcarve = generate_gcode(vcarve_paths, 0, 0, v_feed_rate, f"V-Carve_{v_tool_angle}deg", start_code_input, end_code_input, machine_config["format"], is_3d=True)
 
             ax_path.set_aspect('equal')
