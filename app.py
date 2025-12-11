@@ -6,14 +6,13 @@ import os
 from io import BytesIO
 
 # 幾何学計算ライブラリ
-from shapely.geometry import Polygon, LineString, MultiLineString, Point
-from shapely.ops import unary_union, voronoi_diagram
+from shapely.geometry import Polygon, LineString
 from shapely.affinity import translate
 import ezdxf
 import ezdxf.path
-
-# Vカービング用 (Voronoi計算)
+# Vカービング用
 from scipy.spatial import Voronoi
+from shapely.geometry import Point
 
 # --- 0. ポストプロセッサ定義 ---
 POST_PROCESSORS = {
@@ -132,25 +131,54 @@ def add_dogbone_relief(polygon: Polygon, diameter: float) -> LineString:
     new_coords.append(new_coords[0])
     return LineString(new_coords)
 
+# ★★★ 修正: MultiPolygon対応版ポケット加工生成 ★★★
 def generate_pocket_paths(polygon: Polygon, diameter: float, clearance: float, stepover_ratio: float, dogbone: bool = True) -> list[LineString]:
+    """治具ポケット加工パス生成 (MultiPolygon対応)"""
     tool_r = diameter / 2.0
     boundary_offset = clearance - tool_r
-    try: pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
-    except Exception: return [] 
+    
+    try:
+        # 初期オフセット (ここでMultiPolygonになる可能性がある)
+        pocket_boundary = polygon.buffer(boundary_offset, join_style=2)
+    except Exception:
+        return [] 
+    
     stepover = diameter * stepover_ratio 
-    current_poly = pocket_boundary
+    current_geom = pocket_boundary
     tool_paths = []
-    while current_poly and current_poly.area > 1e-6:
-        if current_poly.exterior: tool_paths.append(current_poly.exterior)
-        try: current_poly = current_poly.buffer(-stepover, join_style=2)
-        except Exception: break 
-        if current_poly.geom_type == 'MultiPolygon':
-            if current_poly.geoms: current_poly = max(current_poly.geoms, key=lambda g: g.area)
-            else: break
-        if current_poly.geom_type != 'Polygon': break
+    
+    # 面積がある限りループ
+    while current_geom and not current_geom.is_empty and current_geom.area > 1e-6:
+        # 現在の形状からパス(外形線)を抽出
+        if current_geom.geom_type == 'Polygon':
+            tool_paths.append(current_geom.exterior)
+            # 中抜き(島)がある場合はその境界もパスに追加
+            for interior in current_geom.interiors:
+                tool_paths.append(interior)
+                
+        elif current_geom.geom_type == 'MultiPolygon':
+            # 分離した全ての島について処理
+            for poly in current_geom.geoms:
+                tool_paths.append(poly.exterior)
+                for interior in poly.interiors:
+                    tool_paths.append(interior)
+        
+        # 次のステップへ内側にオフセット
+        try:
+            current_geom = current_geom.buffer(-stepover, join_style=2)
+        except Exception:
+            break 
+            
+    # ドッグボーン追加 (最初のパスのみ適用してクラッシュ回避)
     if dogbone and tool_paths:
-        try: tool_paths[0] = add_dogbone_relief(Polygon(tool_paths[0]), diameter)
-        except Exception: pass 
+        try:
+            first_path = tool_paths[0]
+            # パスが閉じているか確認してPolygon化
+            if first_path.is_closed:
+                tool_paths[0] = add_dogbone_relief(Polygon(first_path), diameter)
+        except Exception:
+             pass 
+             
     return [LineString(p.coords) for p in tool_paths if p.geom_type in ('LineString', 'LinearRing')]
 
 def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: float = 0.0) -> list[LineString]:
@@ -167,13 +195,7 @@ def generate_chamfer_paths(polygon: Polygon, chamfer_width: float, tip_offset: f
              if g.geom_type == 'Polygon': paths.append(g.exterior)
     return [LineString(p.coords) for p in paths]
 
-# ★★★ 新機能: Vカービング・パス生成ロジック (ボロノイ法) ★★★
 def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: float, step_length: float = 0.1) -> list:
-    """
-    Vカービング用の3Dパス (X, Y, Z) のリストを生成する
-    """
-    # 1. ボロノイ図の作成準備
-    # ポリゴンの輪郭点を細かくサンプリングする
     boundary_line = polygon.exterior
     length = boundary_line.length
     num_points = int(length / step_length)
@@ -182,55 +204,30 @@ def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: fl
     sample_points = [boundary_line.interpolate(i * step_length) for i in range(num_points)]
     coords = np.array([(p.x, p.y) for p in sample_points])
     
-    # 2. ボロノイ図の計算
     vor = Voronoi(coords)
-    
-    # 3. 内部の骨格（Medial Axis）を抽出
     medial_axis_segments = []
     tool_angle_rad = np.radians(tool_angle_deg)
     
-    # ボロノイ辺のうち、ポリゴンの「内部」にあるものを抽出
     for p1_idx, p2_idx in vor.ridge_vertices:
-        if p1_idx == -1 or p2_idx == -1: continue # 無限遠点は無視
-        
+        if p1_idx == -1 or p2_idx == -1: continue
         p1 = vor.vertices[p1_idx]
         p2 = vor.vertices[p2_idx]
-        
-        # 始点と終点がポリゴン内部にあるかチェック
         pt1 = Point(p1)
         pt2 = Point(p2)
         
         if polygon.contains(pt1) and polygon.contains(pt2):
-            # このセグメントは中軸の一部
-            # 各点での「最も近い輪郭までの距離(半径)」を計算
             dist1 = boundary_line.distance(pt1)
             dist2 = boundary_line.distance(pt2)
-            
-            # 深さZを計算: Z = - (半径 / tan(半角))
-            # 半角 = tool_angle / 2
             tan_half_angle = np.tan(tool_angle_rad / 2.0)
             z1 = - (dist1 / tan_half_angle)
             z2 = - (dist2 / tan_half_angle)
-            
-            # 最大深さ制限
-            z1 = max(z1, max_depth) # max_depthはマイナス値 (例: -5.0)
+            z1 = max(z1, max_depth)
             z2 = max(z2, max_depth)
             
-            # 3D座標 (x, y, z) のペアとして保存
-            medial_axis_segments.append([
-                (p1[0], p1[1], z1),
-                (p2[0], p2[1], z2)
-            ])
-            
-    # ※ 本来はここでセグメントを繋いで長いパスにする処理が必要ですが、
-    # 簡易版としてセグメントごとのGコードリストを返します
+            medial_axis_segments.append([(p1[0], p1[1], z1), (p2[0], p2[1], z2)])
     return medial_axis_segments
 
 def generate_gcode(paths: list, z_start: float, z_final: float, feed_rate: float, tool_name: str, header_code: str, footer_code: str, format_type: str = "G00/G01", is_3d: bool = False) -> str:
-    """
-    パスリストからGコードを生成 (3Dパス対応)
-    is_3d=True の場合、pathsは [(x1,y1,z1), (x2,y2,z2)] のリストとみなす
-    """
     gcode = []
     CMD_G0 = "G0" if format_type == "G0/G1" else "G00"
     CMD_G1 = "G1" if format_type == "G0/G1" else "G01"
@@ -242,20 +239,14 @@ def generate_gcode(paths: list, z_start: float, z_final: float, feed_rate: float
     gcode.append("")
     
     if is_3d:
-        # Vカービング用 (各セグメントが独立している簡易実装)
-        # G0で始点へ移動 -> G1で終点へ (Z変化あり) -> G0でリトラクト
-        safe_z = 5.0 # 安全高さ
+        safe_z = 5.0 
         for segment in paths:
             p1, p2 = segment
-            # 始点へ移動 (XYのみ先に移動し、Zを下ろすのが安全)
             gcode.append(f"{CMD_G0} X{p1[0]:.3f} Y{p1[1]:.3f}")
-            gcode.append(f"{CMD_G1} Z{p1[2]:.3f}") # 始点の深さまで切削
-            # 終点へ切削移動 (3D移動)
+            gcode.append(f"{CMD_G1} Z{p1[2]:.3f}")
             gcode.append(f"{CMD_G1} X{p2[0]:.3f} Y{p2[1]:.3f} Z{p2[2]:.3f}")
-            # リトラクト
             gcode.append(f"{CMD_G0} Z{safe_z}")
     else:
-        # 通常の2Dパス (ポケット/面取り)
         for path in paths:
             coords = np.array(path.coords)
             if len(coords) < 1: continue
@@ -275,7 +266,7 @@ def generate_gcode(paths: list, z_start: float, z_final: float, feed_rate: float
 
 st.set_page_config(page_title="Simple CAM + V-Carve", layout="wide")
 st.title("🛠️ 簡易 CNC Gコードジェネレーター")
-st.caption("DXFからポケット、面取り、そしてVカービング加工のGコードを生成します")
+st.caption("DXFから治具ポケットと面取り加工のGコードを生成します")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -284,7 +275,6 @@ with st.sidebar:
 
     st.header("⚙️ 加工設定")
     
-    # タブで加工種類を切り替え
     tab1, tab2, tab3 = st.tabs(["ポケット", "面取り", "Vカーブ"])
     
     with tab1:
@@ -299,17 +289,22 @@ with st.sidebar:
     with tab2:
         st.subheader("Vビット (面取り)")
         chamfer_width = st.number_input("面取り幅 (mm)", value=0.5, step=0.1, format="%.1f")
-        tip_offset = st.number_input("刃先オフセット (mm)", value=1.0, step=0.1, format="%.1f", help="Vビットの腹を使うためのオフセット")
-        z_chamfer_depth = -1.0 # 仮の深さ計算用
+        tip_offset = st.number_input("刃先オフセット (mm)", value=1.0, step=0.1, format="%.1f")
+        z_chamfer_depth = -1.0 
         if tip_offset < 0: st.error("⚠️ 警告: 刃先オフセットがマイナスです")
+        
+        # 面取り深さ計算
+        z_chamfer_final = - (chamfer_width + tip_offset)
+        if z_chamfer_final < 0:
+             if z_chamfer_final < -5.0: 
+                 st.warning(f"面取り深さ Z{z_chamfer_final:.2f} が深すぎる可能性があります")
         feed_rate_chamfer = st.number_input("送り速度 (mm/min)", value=300, step=10, key="feed_chamfer")
 
     with tab3:
         st.subheader("Vカービング (彫刻)")
-        v_tool_angle = st.number_input("Vビット角度 (度)", value=60.0, step=5.0, format="%.1f", help="60度, 90度など")
-        v_max_depth = st.number_input("最大深さ制限 (mm)", value=-3.0, max_value=0.0, step=0.1, format="%.1f", help="これ以上深く彫らない(底を平らにする)")
+        v_tool_angle = st.number_input("Vビット角度 (度)", value=60.0, step=5.0, format="%.1f")
+        v_max_depth = st.number_input("最大深さ制限 (mm)", value=-3.0, max_value=0.0, step=0.1, format="%.1f")
         v_feed_rate = st.number_input("送り速度 (mm/min)", value=300, step=10, key="feed_vcarve")
-        st.caption("※Vカービングは計算に時間がかかる場合があります")
 
     st.divider()
     st.header("📝 Gコード設定")
@@ -347,61 +342,46 @@ if uploaded_file is not None:
         with col2:
             st.header("2. 生成結果")
             
-            # --- 各パスの計算 ---
             # 1. ポケット
             pocket_paths = generate_pocket_paths(main_polygon, tool_diameter, clearance, stepover_ratio, add_dogbone)
             
             # 2. 面取り
-            # 面取り深さの計算 (アクリル厚み等は省略し、単純な深さ計算)
-            # ユーザーが指定したいのは「面取り幅」と「オフセット」なので、Zはそれに従属する
-            # ここでは簡易的に Z = - (面取り幅 + オフセット) と仮定 (90度ビットの場合)
-            # ※本来は角度計算が必要だが、面取りタブには角度入力がないため90度固定とする
             z_chamfer_final = - (chamfer_width + tip_offset)
             chamfer_paths = generate_chamfer_paths(main_polygon, chamfer_width, tip_offset)
-            if z_chamfer_final < 0:
-                 if z_chamfer_final < -5.0: # 仮の治具深さ警告
-                     st.warning(f"面取り深さ Z{z_chamfer_final:.2f} が深すぎる可能性があります")
 
             # 3. Vカービング
             vcarve_paths = []
-            if tab3: # Vカーブタブが選ばれているわけではないが、計算はしておく
+            if tab3:
                 vcarve_paths = generate_vcarve_paths(main_polygon, v_tool_angle, v_max_depth)
 
-            # --- プロット ---
+            # プロット
             fig_path, ax_path = plt.subplots(figsize=(5, 5))
             ax_path.plot(x, y, color='gray', linestyle='--', alpha=0.5)
             ax_path.axhline(y=0, color='k', linewidth=0.8)
             ax_path.axvline(x=0, color='k', linewidth=0.8)
             
-            # Gコード生成
             gcode_pocket = None
             gcode_chamfer = None
             gcode_vcarve = None
 
-            # ポケット描画 & Gコード
             if pocket_paths:
                 for p in pocket_paths: ax_path.plot(p.xy[0], p.xy[1], color='orange', linewidth=1)
                 gcode_pocket = generate_gcode(pocket_paths, 0.0, pocket_depth, feed_rate_pocket, "Pocket_EM", start_code_input, end_code_input, machine_config["format"])
 
-            # 面取り描画 & Gコード
             if chamfer_paths:
                 for p in chamfer_paths: ax_path.plot(p.xy[0], p.xy[1], color='green', linewidth=1)
                 gcode_chamfer = generate_gcode(chamfer_paths, 0.0, z_chamfer_final, feed_rate_chamfer, "Chamfer_Bit", start_code_input, end_code_input, machine_config["format"])
 
-            # Vカーブ描画 & Gコード
             if vcarve_paths:
-                # Vカーブは3Dパスなので、XY平面に投影して描画
                 for seg in vcarve_paths:
                     p1, p2 = seg
                     ax_path.plot([p1[0], p2[0]], [p1[1], p2[1]], color='red', linewidth=0.5)
-                
-                # Vカーブ用Gコード生成 (is_3d=True)
                 gcode_vcarve = generate_gcode(vcarve_paths, 0, 0, v_feed_rate, f"V-Carve_{v_tool_angle}deg", start_code_input, end_code_input, machine_config["format"], is_3d=True)
 
             ax_path.set_aspect('equal')
             st.pyplot(fig_path)
             
-            # --- ダウンロード ---
+            # ダウンロード
             st.subheader("Gコード ダウンロード")
             c1, c2, c3 = st.columns(3)
             with c1:
