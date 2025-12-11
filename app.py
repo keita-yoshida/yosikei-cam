@@ -7,7 +7,10 @@ from io import BytesIO
 
 # 幾何学計算ライブラリ
 from shapely.geometry import Polygon, LineString, MultiLineString, Point
-from shapely.ops import translate, linemerge
+# ★★★ 修正: translate は affinity から、linemerge は ops からインポート ★★★
+from shapely.affinity import translate
+from shapely.ops import linemerge, unary_union
+
 import ezdxf
 import ezdxf.path
 
