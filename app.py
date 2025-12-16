@@ -271,6 +271,9 @@ def generate_vcarve_paths(polygon: Polygon, tool_angle_deg: float, max_depth: fl
             
     # 4. 線分を結合して「一筆書き」に近い長いパスにする (Line Merge)
     # これにより G0 (空移動) が激減し、きれいなデータになる
+    if not raw_segments:
+        return []
+        
     merged_lines = linemerge(raw_segments)
     
     final_3d_paths = []
