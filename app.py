@@ -391,7 +391,7 @@ with st.sidebar:
     
     with tab1:
         st.subheader("エンドミル (ポケット)")
-        dia = st.number_input("工具径 (mm)", 0, step=0.1)
+        dia = st.number_input("工具径 (mm)", 0.1, step=0.1)
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
         step = st.slider("ステップオーバー (%)", 10, 90, 50) / 100.0
