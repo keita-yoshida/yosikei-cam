@@ -39,10 +39,10 @@ POST_PROCESSORS = {
     }
 }
 
-# --- 1. 幾何学・ユーティリティ ---
+# --- 1. 幾何学ユーティリティ ---
 
 def ensure_list_of_polys(geometry):
-    """どんなGeometryが来ても必ずPolygonのリストにして返す便利関数"""
+    """どんなGeometryが来ても必ずPolygonのリストにして返す"""
     if geometry is None or geometry.is_empty:
         return []
     if geometry.geom_type == 'Polygon':
@@ -72,7 +72,7 @@ def dist_lseg(l1, l2, p):
     return math.sqrt((xi - (x0 + t*dx))**2 + (yi - (y0 + t*dy))**2)
 
 def douglas_peucker(points, tolerance):
-    """パスの間引き"""
+    """パスの間引き (データ削減)"""
     if len(points) < 3: return points
     dmax = 0
     index = 0
@@ -90,11 +90,14 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """単一ポリゴンへのドッグボーン適用"""
+    """
+    単一ポリゴンへのドッグボーン適用
+    角の頂点に円を配置して合成する（最も確実で綺麗な方法）
+    """
     if polygon.is_empty: return polygon
     
-    # 簡易化してノイズ除去
-    poly = polygon.simplify(0.01)
+    # 処理前に軽く正規化（ノイズ除去）
+    poly = polygon.simplify(0.001)
     if poly.geom_type != 'Polygon': return polygon
     
     coords = list(poly.exterior.coords)
@@ -118,30 +121,38 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         v1 /= norm1
         v2 /= norm2
         
-        # 内角判定
+        # 内角・外角判定
         cross_prod = np.cross(v1, v2)
-        angle = math.degrees(math.atan2(cross_prod, np.dot(v1, v2)))
+        dot_prod = np.dot(v1, v2)
+        angle = math.degrees(math.atan2(cross_prod, dot_prod))
         
-        # 90度前後の内角を対象 (-135 ~ -45)
-        if -135 < angle < -45: 
-            bisector = -v1 + v2
-            norm_b = np.linalg.norm(bisector)
-            if norm_b > 1e-6:
-                bisector /= norm_b
-                # 円配置
-                offset_dist = r * (math.sqrt(2) - 1)
-                center_pos = p_curr + bisector * offset_dist
-                dogbone_circles.append(Point(center_pos).buffer(r + 0.01))
+        # ポケット加工（内側を削る）前提：
+        # ポリゴンの「内側に尖っている角（＝90度などの凸角）」に対して逃げを作る
+        # Shapelyの標準的なポリゴン（反時計回り）では、左折がプラス、右折がマイナス
+        # ポケットの内角（四角形の角など）は、進行方向に対して「左折」する箇所
+        
+        # ターゲット：約90度の角 (45度〜135度)
+        # ドッグボーンは、刃物が入らない「隅」に入れるもの
+        if 45 < abs(angle) < 135:
+            # 頂点を中心とした円を作成
+            # これにより、刃物の中心が頂点まで到達できるようになる
+            # resolution=16 で円を滑らかに
+            circle = Point(p_curr).buffer(r, resolution=16)
+            dogbone_circles.append(circle)
 
     if not dogbone_circles:
         return polygon
         
+    # 元のポリゴンとドッグボーン穴（円）を結合
     combined = unary_union([polygon] + dogbone_circles)
-    return combined.simplify(0.01)
+    # 結合後の微細なバリ取り（円の形状を保つためtoleranceは小さく）
+    return combined.simplify(0.005)
 
 def apply_dogbone(geometry, tool_dia):
-    """すべてのパーツにドッグボーンを適用"""
+    """全てのパーツにドッグボーンを適用"""
     polys = ensure_list_of_polys(geometry)
+    if not polys: return geometry
+    
     new_parts = [apply_dogbone_single(p, tool_dia) for p in polys]
     return unary_union(new_parts)
 
@@ -160,20 +171,20 @@ def dxf_to_shapely(dxf_bytes):
             if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE'):
                 try:
                     p = ezdxf.path.make_path(e)
-                    pts = list(p.flattening(0.05))
+                    pts = list(p.flattening(0.01)) # 精度高め
                     if len(pts) > 2:
                         poly = Polygon([(v.x, v.y) for v in pts])
-                        if poly.is_valid and poly.area > 0.5:
+                        if poly.is_valid and poly.area > 0.1:
                             polys.append(poly)
                         elif not poly.is_valid:
                             clean = make_valid(poly)
-                            if clean.area > 0.5: polys.append(clean)
+                            if clean.area > 0.1: polys.append(clean)
                 except: pass
         
         if not polys: return None
         # 全図形を結合して1つのGeometryオブジェクトにする
         combined = unary_union(polys)
-        return combined.simplify(0.02, preserve_topology=True)
+        return combined
         
     except Exception as e:
         st.error(f"DXF Error: {e}")
@@ -181,7 +192,7 @@ def dxf_to_shapely(dxf_bytes):
     finally:
         if os.path.exists(tmp_path): os.unlink(tmp_path)
 
-# --- 3. パス生成ロジック (Multi-Path対応) ---
+# --- 3. パス生成ロジック ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     # ドッグボーン処理
@@ -191,18 +202,18 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     
     paths = []
     r = tool_d / 2.0
-    offset_dist = -(r - clearance)
+    offset_dist = -(r - clearance) # 内側へオフセット
     
-    # 最初のオフセット
     try:
-        current = work_geom.buffer(offset_dist, join_style=2)
+        # 最初の壁際パス
+        current = work_geom.buffer(offset_dist, join_style=2) # 2=Miter
     except:
         return []
 
     step = tool_d * stepover
     
-    # ループ処理 (図形が消滅するまで内側にオフセットし続ける)
-    while not current.is_empty and current.area > 0.1:
+    # ループ処理 (図形が消滅するまで内側にオフセット)
+    while not current.is_empty and current.area > 0.01:
         # 現在の形状からパスを抽出 (MultiPolygon対応)
         current_polys = ensure_list_of_polys(current)
         
@@ -217,29 +228,39 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
 
 def generate_chamfer(geometry, width, tip_offset):
     offset = tip_offset
-    if offset <= 0:
-        polys = ensure_list_of_polys(geometry)
-        return [p.exterior for p in polys]
+    polys = ensure_list_of_polys(geometry)
     
-    p = geometry.buffer(offset, join_style=1)
-    polys = ensure_list_of_polys(p)
+    if offset <= 0:
+        paths = []
+        for p in polys:
+            paths.append(p.exterior)
+            paths.extend(p.interiors)
+        return [LineString(ls.coords) for ls in paths]
+    
+    # 外側へオフセット (面取り)
+    # 注: 面取りは通常、図形の「外形」を削るなら外側オフセット、「穴」なら内側オフセット
+    # ここでは簡易的に全輪郭を外側へオフセットする (buffer正値)
+    # 穴(内側)に対して正のbufferをかけると穴は小さくなる＝内側へオフセットされるので正解
+    p = geometry.buffer(offset, join_style=1) # 1=Round
+    p_list = ensure_list_of_polys(p)
     
     paths = []
-    for poly in polys:
+    for poly in p_list:
         paths.append(poly.exterior)
         paths.extend(poly.interiors)
             
     return [LineString(ls.coords) for ls in paths]
 
-def generate_vcarve_single(polygon, angle_deg, max_d, step_len=0.1):
+def generate_vcarve_single(polygon, angle_deg, use_limit, max_d, step_len=0.1):
     """1つのPolygonに対するVカーブ計算"""
-    simple_poly = polygon.simplify(0.05)
+    # 高速化のため少し単純化
+    simple_poly = polygon.simplify(0.02)
     line = simple_poly.exterior
     
     length = line.length
     num = int(length / step_len)
-    if num > 1000: num = 1000 # 高速化
-    if num < 10: num = 10
+    if num > 1000: num = 1000
+    if num < 20: num = 20
     
     pts = [line.interpolate(i * length / num) for i in range(num)]
     coords = np.array([(p.x, p.y) for p in pts])
@@ -254,6 +275,7 @@ def generate_vcarve_single(polygon, angle_deg, max_d, step_len=0.1):
         if p1i < 0 or p2i < 0: continue
         p1 = vor.vertices[p1i]
         p2 = vor.vertices[p2i]
+        # ポリゴン内部の線分のみ抽出
         if simple_poly.contains(Point(p1)) and simple_poly.contains(Point(p2)):
             segments.append(LineString([p1, p2]))
             
@@ -277,22 +299,27 @@ def generate_vcarve_single(polygon, angle_deg, max_d, step_len=0.1):
             pt = l.interpolate(i * step_len)
             d = line.distance(pt)
             z = -(d / tan_a)
-            if z < max_d: z = max_d
+            
+            # 深さ制限 (有効な場合のみ)
+            if use_limit:
+                if z < max_d: z = max_d
+                
             l_pts.append((pt.x, pt.y, z))
             
+        # データ削減
         if len(l_pts) > 1:
             l_pts = douglas_peucker(l_pts, 0.05)
             final_paths.append(l_pts)
             
     return final_paths
 
-def generate_vcarve(geometry, angle_deg, max_d, step_len=0.1):
+def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     """すべての図形に対してVカーブを計算"""
     all_paths = []
     polys = ensure_list_of_polys(geometry)
     
     for p in polys:
-        paths = generate_vcarve_single(p, angle_deg, max_d, step_len)
+        paths = generate_vcarve_single(p, angle_deg, use_limit, max_d, step_len)
         all_paths.extend(paths)
         
     return all_paths
@@ -327,7 +354,7 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
     gc.append(footer.strip())
     return "\n".join(gc)
 
-# --- 4. UI ---
+# --- 3. UI ---
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
@@ -360,7 +387,13 @@ with st.sidebar:
     with tab3:
         st.subheader("Vカービング")
         v_ang = st.number_input("Vビット角度", 60.0, step=10.0)
-        v_lim = st.number_input("最大深さ制限", -3.0, max_value=0.0)
+        
+        # 深さ制限のUI改善
+        use_v_limit = st.checkbox("深さ制限を有効にする", value=False)
+        v_lim = -10.0 # デフォルト
+        if use_v_limit:
+            v_lim = st.number_input("最大深さ制限 (mm)", value=-3.0, max_value=0.0, step=0.1)
+            
         feed_v = st.number_input("送り速度 (V)", 300, step=50)
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
 
@@ -391,16 +424,17 @@ if f:
         c1, c2 = st.columns(2)
         with c1:
             st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
-            fig, ax = plt.subplots(figsize=(4,4))
+            fig, ax = plt.subplots(figsize=(5,5))
             
-            # 元図形の描画 (どんな形状でもリスト化して描画)
+            # 元図形の描画 (全てのパスを描画)
             polys = ensure_list_of_polys(geom)
             for p in polys:
-                ax.plot(*p.exterior.xy, 'b')
-                for interior in p.interiors: ax.plot(*interior.xy, 'b')
+                ax.plot(*p.exterior.xy, 'k', linewidth=1, label='Original' if p == polys[0] else "")
+                for interior in p.interiors: ax.plot(*interior.xy, 'k', linewidth=1)
                     
             ax.axis('equal')
             ax.grid(True, linestyle=':', alpha=0.5)
+            # 凡例表示のためにダミープロットを使う場合もあるが、ここではシンプルに
             st.pyplot(fig)
             
         with c2:
@@ -418,24 +452,38 @@ if f:
             v_paths = []
             if tab3: 
                 with st.spinner("Vカービングパス計算中..."):
-                    v_paths = generate_vcarve(geom, v_ang, v_lim, v_res)
+                    v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
             gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
             
-            # プレビュー
-            fig2, ax2 = plt.subplots(figsize=(4,4))
-            # 元図形
+            # プレビュー (凡例付き)
+            fig2, ax2 = plt.subplots(figsize=(5,5))
+            
+            # 元図形(薄く)
             for p in polys:
-                ax2.plot(*p.exterior.xy, 'k--', alpha=0.3)
-                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.3)
+                ax2.plot(*p.exterior.xy, 'k--', alpha=0.2)
+                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.2)
+            
+            # 各パスの描画
+            added_labels = set()
             
             if p_paths:
-                for ls in p_paths: ax2.plot(*ls.xy, 'orange', alpha=0.8, linewidth=1, label='Pocket')
-            if c_paths:
-                for ls in c_paths: ax2.plot(*ls.xy, 'g', alpha=0.8, linewidth=1, label='Chamfer')
-            if v_paths:
-                for pts in v_paths:
-                    ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r', linewidth=0.6, label='V-Carve')
+                label = 'Pocket' if 'Pocket' not in added_labels else ""
+                added_labels.add('Pocket')
+                for ls in p_paths: ax2.plot(*ls.xy, color='orange', alpha=0.9, linewidth=1.5, label=label)
                     
+            if c_paths:
+                label = 'Chamfer' if 'Chamfer' not in added_labels else ""
+                added_labels.add('Chamfer')
+                for ls in c_paths: ax2.plot(*ls.xy, color='green', alpha=0.9, linewidth=1.5, label=label)
+                    
+            if v_paths:
+                label = 'V-Carve' if 'V-Carve' not in added_labels else ""
+                added_labels.add('V-Carve')
+                for pts in v_paths:
+                    ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='red', linewidth=0.8, label=label)
+                    if label: label = "" # ラベルは最初の一回だけ
+            
+            ax2.legend() # 凡例を表示
             ax2.axis('equal')
             st.pyplot(fig2)
             
