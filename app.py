@@ -426,4 +426,78 @@ if f:
     
     if geom and not geom.is_empty:
         minx, miny, maxx, maxy = geom.bounds
-        w
+        w, h = maxx-minx, maxy-miny
+        
+        if origin == "Bottom-Left":
+            geom = translate(geom, -minx, -miny)
+        elif origin == "Center":
+            geom = translate(geom, -(minx+w/2), -(miny+h/2))
+            
+        c1, c2 = st.columns(2)
+        with c1:
+            st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
+            fig, ax = plt.subplots(figsize=(5,5))
+            
+            # 元図形の描画
+            polys = ensure_list_of_polys(geom)
+            for i, p in enumerate(polys):
+                label = "Original" if i == 0 else ""
+                ax.plot(*p.exterior.xy, 'k', linewidth=1.5, label=label)
+                for interior in p.interiors: ax.plot(*interior.xy, 'k', linewidth=1.5)
+                    
+            ax.axis('equal')
+            ax.grid(True, linestyle=':', alpha=0.5)
+            ax.legend(loc='upper right')
+            st.pyplot(fig)
+            
+        with c2:
+            st.header("2. パス生成")
+            
+            # パス計算
+            p_paths = generate_pocket(geom, dia, clear, step, use_dogbone)
+            c_paths = generate_chamfer(geom, chamfer_w, tip_off)
+            
+            v_paths = []
+            if tab3: 
+                with st.spinner("Vカービングパス計算中..."):
+                    v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
+
+            # Gコード生成
+            gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
+            gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
+            gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
+            
+            # --- プレビュー (凡例付き) ---
+            fig2, ax2 = plt.subplots(figsize=(5,5))
+            
+            # 元図形(薄く)
+            for p in polys:
+                ax2.plot(*p.exterior.xy, 'k--', alpha=0.15)
+                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.15)
+            
+            #  凡例のダミー
+            ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
+            ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
+            ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
+
+            # 実プロット
+            if p_paths:
+                for ls in p_paths: ax2.plot(*ls.xy, color='tab:blue', alpha=0.9, linewidth=1.0)
+            if c_paths:
+                for ls in c_paths: ax2.plot(*ls.xy, color='tab:green', alpha=0.9, linewidth=1.0)
+            if v_paths:
+                for pts in v_paths:
+                    ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='tab:red', linewidth=0.8)
+            
+            ax2.legend(loc='upper right', framealpha=0.9)
+            ax2.axis('equal')
+            st.pyplot(fig2)
+            
+            # ダウンロードボタン
+            b1, b2, b3 = st.columns(3)
+            if gc_p: b1.download_button("📥 POCKET.nc", gc_p, "pocket.nc")
+            if gc_c: b2.download_button("📥 CHAMFER.nc", gc_c, "chamfer.nc")
+            if gc_v: b3.download_button("📥 VCARVE.nc", gc_v, "vcarve.nc")
+            
+    else:
+        st.error("有効な閉じた図形が見つかりません。")
