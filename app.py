@@ -1,7 +1,6 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import tempfile
 import os
 import math
@@ -90,7 +89,6 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     """ドッグボーン適用 (頂点拡張方式)"""
     if polygon.is_empty: return polygon
     
-    # 形状の微細なノイズのみ除去 (角を丸めないよう許容値を極小に)
     poly = polygon.simplify(0.0001)
     if poly.geom_type != 'Polygon': return polygon
     
@@ -116,29 +114,22 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         v1 /= n1
         v2 /= n2
         
-        # 角度計算
         cross = np.cross(v1, v2)
         dot = np.dot(v1, v2)
         angle = math.degrees(math.atan2(cross, dot))
         
-        # 直線以外(5度以上の曲がり)かつ、内角側の凸部に対して処理
-        # 菱形のような鋭角(30度)も、六角形(120度)もカバー
         if abs(angle) > 5:
             bisector = v2 - v1
             bn = np.linalg.norm(bisector)
             if bn > 1e-6:
                 bisector /= bn
-                
-                # ベクトルが「ポリゴンの内側」を向くように調整
-                # (ドッグボーンは母材＝ポリゴン を削り広げるものなので、中心はポリゴン内にあるべき)
                 test_pt = p_curr + bisector * 0.01
+                # ポリゴンの内側を向くように調整
                 if not poly.contains(Point(test_pt)):
                     bisector = -bisector
                 
-                # 配置位置: 頂点から内側へ
                 dist = r * overcut_ratio
                 center = p_curr + bisector * dist
-                
                 circle = Point(center).buffer(r, resolution=16)
                 dogbone_circles.append(circle)
 
@@ -152,13 +143,13 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
 def apply_dogbone(geometry, tool_dia):
     polys = ensure_list_of_polys(geometry)
     if not polys: return geometry
-    # 外形(Polygon)ごとに適用
     new_parts = [apply_dogbone_single(p, tool_dia) for p in polys]
     return unary_union(new_parts)
 
-# --- 2. データ読み込み (XOR処理に変更) ---
+# --- 2. データ読み込み (個別パス保持版) ---
 
-def dxf_to_shapely(dxf_bytes):
+def dxf_to_shapely_list(dxf_bytes):
+    """DXFを読み込み、個別のPolygonリストとして返す（結合しない）"""
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
         tmp.write(dxf_bytes)
         tmp_path = tmp.name
@@ -184,38 +175,39 @@ def dxf_to_shapely(dxf_bytes):
                             polys.append(poly)
                         elif not poly.is_valid:
                             clean = make_valid(poly)
-                            if clean.area > 0.01: polys.append(clean)
+                            if clean.area > 0.01: 
+                                if clean.geom_type == 'Polygon':
+                                    polys.append(clean)
+                                elif clean.geom_type == 'MultiPolygon':
+                                    polys.extend(clean.geoms)
                 except: pass
         
-        if not polys: return None
-        
-        # ★★★ 修正: 単純結合(Union)ではなく、XOR(Symmetric Difference)で結合する ★★★
-        # これにより、「枠の中にある円」は「穴」として認識されるようになります。
-        
-        # 面積の大きい順にソート (大きい枠から順に処理すると安定する)
+        # 面積順にソート（大きい順）
         polys.sort(key=lambda x: x.area, reverse=True)
+        return polys
         
-        combined = Polygon()
-        for p in polys:
-            if combined.is_empty:
-                combined = p
-            else:
-                combined = combined.symmetric_difference(p)
-                
-        return combined
     except Exception as e:
         st.error(f"DXF Read Error: {e}")
-        return None
+        return []
     finally:
         if os.path.exists(tmp_path): os.unlink(tmp_path)
 
-# --- 3. ドリル穴検出ロジック (穴＝Interiorsにも対応) ---
+def merge_polygons_xor(polys):
+    """リスト内のポリゴンをXOR結合して一つのGeometryにする"""
+    if not polys: return None
+    combined = Polygon()
+    for p in polys:
+        if combined.is_empty:
+            combined = p
+        else:
+            combined = combined.symmetric_difference(p)
+    return combined
+
+# --- 3. ドリル穴検出ロジック ---
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
     polys = ensure_list_of_polys(geometry)
     drill_points = []
-    
-    target_r = target_dia / 2.0
     
     def check_poly(p):
         minx, miny, maxx, maxy = p.bounds
@@ -224,16 +216,12 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         if abs(w - h) > tolerance: return None
         if not (target_dia - tolerance <= w <= target_dia + tolerance): return None
         expected_area = math.pi * ((w/2)**2)
-        # 許容誤差を少し緩めに(20%)
         if abs(p.area - expected_area) / expected_area > 0.2: return None
         return p.centroid
 
     for p in polys:
-        # 1. 外形が円の場合 (ただの円)
         pt = check_poly(p)
         if pt: drill_points.append(pt)
-        
-        # 2. ★中抜き穴(Interior)が円の場合 (菱形の中の丸など)
         for interior in p.interiors:
             hole_poly = Polygon(interior)
             pt = check_poly(hole_poly)
@@ -381,17 +369,21 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 3.2: 菱形/六角形ドッグボーン完全対応・中抜きドリル対応")
+st.caption("Ver 3.3: パス選択機能追加版")
 
 with st.sidebar:
     st.header("📍 原点設定")
     origin = st.radio("加工原点 (0,0)", ["Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"], index=0)
     st.divider()
     
+    # ★ 加工種類のON/OFFフラグ
+    st.header("⚙️ 加工設定")
+    
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
     with tab1:
-        st.subheader("エンドミル (ポケット)")
+        enable_pocket = st.checkbox("ポケット加工を有効にする", True)
+        st.divider()
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
@@ -400,7 +392,8 @@ with st.sidebar:
         feed_p = st.number_input("送り速度 (mm/min)", 300, step=50, key="fp")
         
     with tab2:
-        st.subheader("Vビット (面取り)")
+        enable_chamfer = st.checkbox("面取り加工を有効にする", True)
+        st.divider()
         chamfer_w = st.number_input("面取り幅 (mm)", 0.5, step=0.1)
         tip_off = st.number_input("刃先オフセット (mm)", 1.0, step=0.1)
         feed_c = st.number_input("送り速度 (mm/min)", 300, step=50, key="fc")
@@ -408,7 +401,8 @@ with st.sidebar:
         st.caption(f"切込深さ: {z_c:.2f}mm")
         
     with tab3:
-        st.subheader("Vカービング (彫刻)")
+        enable_vcarve = st.checkbox("Vカーブ加工を有効にする", False)
+        st.divider()
         v_ang = st.number_input("Vビット角度 (度)", 60.0, step=10.0)
         use_v_limit = st.checkbox("深さ制限を有効にする", value=False)
         if use_v_limit:
@@ -419,7 +413,8 @@ with st.sidebar:
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
 
     with tab4:
-        st.subheader("ドリル加工 (穴あけ)")
+        enable_drill = st.checkbox("ドリル加工を有効にする", False)
+        st.divider()
         drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f", help="DXF内でこの直径を持つ円だけを穴あけします")
         drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
         peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5, help="1回に掘り進む深さ")
@@ -437,64 +432,116 @@ st.header("1. DXFアップロード")
 f = st.file_uploader("", type=["dxf"])
 
 if f:
-    geom = dxf_to_shapely(f.getvalue())
+    # リストとして読み込み (結合しない)
+    polys_raw = dxf_to_shapely_list(f.getvalue())
     
-    if geom and not geom.is_empty:
-        minx, miny, maxx, maxy = geom.bounds
+    if polys_raw:
+        # 原点移動計算のために一旦結合したboundsを取得
+        temp_union = unary_union(polys_raw)
+        minx, miny, maxx, maxy = temp_union.bounds
         w, h = maxx-minx, maxy-miny
         
+        offset_x, offset_y = 0, 0
         if origin == "Bottom-Left":
-            geom = translate(geom, -minx, -miny)
+            offset_x, offset_y = -minx, -miny
         elif origin == "Center":
-            geom = translate(geom, -(minx+w/2), -(miny+h/2))
+            offset_x, offset_y = -(minx+w/2), -(miny+h/2)
             
+        # 全てのポリゴンを移動
+        polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
+        
+        # --- 選択UIの表示 ---
+        st.sidebar.divider()
+        st.sidebar.subheader("📐 パス選択")
+        
+        selected_indices = []
+        
+        # 個別選択チェックボックス
+        # デフォルトですべて選択状態にする
+        container = st.sidebar.container()
+        all_checked = container.checkbox("すべて選択", value=True)
+        
+        for i, p in enumerate(polys_moved):
+            area = p.area
+            is_checked = container.checkbox(f"Path #{i+1} (面積: {area:.1f})", value=all_checked, key=f"p_{i}")
+            if is_checked:
+                selected_indices.append(i)
+                
+        # 選択されたポリゴンのみを抽出
+        target_polys = [polys_moved[i] for i in selected_indices]
+        
+        # 計算用に結合 (XORで穴あき処理)
+        geom_for_calc = merge_polygons_xor(target_polys)
+        
         c1, c2 = st.columns(2)
         with c1:
             st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
             fig, ax = plt.subplots(figsize=(5,5))
             
-            polys = ensure_list_of_polys(geom)
-            for i, p in enumerate(polys):
-                label = "Original" if i == 0 else ""
-                ax.plot(*p.exterior.xy, 'k', linewidth=1.5, label=label)
-                for interior in p.interiors: ax.plot(*interior.xy, 'k', linewidth=1.5)
+            # 全てのパスを表示 (選択外は薄く、選択内は濃く)
+            for i, p in enumerate(polys_moved):
+                if i in selected_indices:
+                    style = 'k-' # 実線
+                    alpha = 1.0
+                    lw = 1.5
+                else:
+                    style = 'k:' # 点線
+                    alpha = 0.2
+                    lw = 0.5
                     
+                ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=lw)
+                for interior in p.interiors: 
+                    ax.plot(*interior.xy, style, alpha=alpha, linewidth=lw)
+            
+            # ドリル位置のプレビュー (選択されたものだけ)
+            if enable_drill and geom_for_calc:
+                 drill_preview = find_drill_points(geom_for_calc, drill_dia_target)
+                 for pt in drill_preview:
+                     ax.plot(pt.x, pt.y, 'x', color='tab:purple')
+
             ax.axis('equal')
             ax.grid(True, linestyle=':', alpha=0.5)
-            ax.legend(loc='upper right')
             st.pyplot(fig)
             
         with c2:
             st.header("2. パス生成")
             
-            # --- 計算処理 ---
-            p_paths = generate_pocket(geom, dia, clear, step, use_dogbone)
-            gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
-            
-            c_paths = generate_chamfer(geom, chamfer_w, tip_off)
-            gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
-            
-            v_paths = []
-            if tab3: 
-                with st.spinner("Vカービングパス計算中..."):
-                    v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
-            gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
-            
-            drill_pts = find_drill_points(geom, drill_dia_target)
-            gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
+            p_paths, c_paths, v_paths, drill_pts = [], [], [], []
+            gc_p, gc_c, gc_v, gc_d = None, None, None, None
+
+            if geom_for_calc and not geom_for_calc.is_empty:
+                # --- 計算処理 (有効なものだけ) ---
+                if enable_pocket:
+                    p_paths = generate_pocket(geom_for_calc, dia, clear, step, use_dogbone)
+                    gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
+                
+                if enable_chamfer:
+                    c_paths = generate_chamfer(geom_for_calc, chamfer_w, tip_off)
+                    gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
+                
+                if enable_vcarve:
+                    if tab3: 
+                        with st.spinner("Vカービングパス計算中..."):
+                            v_paths = generate_vcarve(geom_for_calc, v_ang, use_v_limit, v_lim, v_res)
+                    gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
+                
+                if enable_drill:
+                    drill_pts = find_drill_points(geom_for_calc, drill_dia_target)
+                    gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             # --- プレビュー ---
             fig2, ax2 = plt.subplots(figsize=(5,5))
             
-            for p in polys:
-                ax2.plot(*p.exterior.xy, 'k--', alpha=0.15)
-                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.15)
+            # 元図形(薄く)
+            for p in polys_moved:
+                ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
+                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
             
             # 凡例用ダミー
-            ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
-            ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
-            ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
-            ax2.plot([], [], color='tab:purple', marker='x', linestyle='None', label='Drill')
+            if enable_pocket: ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
+            if enable_chamfer: ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
+            if enable_vcarve: ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
+            if enable_drill: ax2.plot([], [], color='tab:purple', marker='x', linestyle='None', label='Drill')
 
             # 実プロット
             if p_paths:
