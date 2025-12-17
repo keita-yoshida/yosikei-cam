@@ -378,8 +378,8 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 # --- 4. UI ---
 
-st.set_page_config(page_title="Multi-Path CAM", layout="wide")
-st.title("⚡ Multi-Path CAM")
+st.set_page_config(page_title="yosikeiCAM", layout="wide")
+st.title("yosikeiCAM")
 st.caption("Ver 2.2: 菱形/六角形ドッグボーン対応・凡例表示・深さ制限修正")
 
 with st.sidebar:
