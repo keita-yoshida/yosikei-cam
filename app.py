@@ -186,69 +186,40 @@ def dxf_to_shapely(dxf_bytes):
 # --- 3. ドリル穴検出ロジック ---
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
-    """
-    指定された直径に近い円形ポリゴンを探し、中心座標を返す
-    """
     polys = ensure_list_of_polys(geometry)
     drill_points = []
-    
-    target_r = target_dia / 2.0
-    tol_r = tolerance / 2.0
-    
     for p in polys:
         minx, miny, maxx, maxy = p.bounds
         w = maxx - minx
         h = maxy - miny
-        
-        # 1. バウンディングボックスのアスペクト比チェック (正方形に近いか)
         if abs(w - h) > tolerance: continue
-        
-        # 2. サイズチェック
         if not (target_dia - tolerance <= w <= target_dia + tolerance): continue
-        
-        # 3. 真円度チェック (面積 / (π*r^2))
-        # ポリゴン近似されているので、少し甘めに判定
         expected_area = math.pi * ((w/2)**2)
-        if abs(p.area - expected_area) / expected_area > 0.15: continue # 15%以上の誤差なら円じゃないかも
-        
-        # 円と認定
+        if abs(p.area - expected_area) / expected_area > 0.15: continue
         drill_points.append(p.centroid)
-        
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
     if not points: return None
-    
     gc = [header.strip(), f"; Tool: {tool_name} (Drill)", "T1 M06", f"F{int(feed)}", ""]
     G0 = "G0" if "G0/" in fmt else "G00"
     G1 = "G1" if "G0/" in fmt else "G01"
     safe = 5.0
-    retract = 1.0 # ペッキング時の戻り高さ (穴底から少し上)
-    
     for pt in points:
         x, y = pt.x, pt.y
         gc.append(f"; Drill Hole at X{x:.2f} Y{y:.2f}")
         gc.append(f"{G0} X{x:.3f} Y{y:.3f}")
-        gc.append(f"{G0} Z{z_start + 1.0}") # 早送りで素材直上へ
-        
+        gc.append(f"{G0} Z{z_start + 1.0}")
         current_z = z_start
-        
-        # ペッキングループ
         while current_z > z_final:
             target_z = current_z - peck_depth
             if target_z < z_final: target_z = z_final
-            
-            gc.append(f"{G1} Z{target_z:.3f}") # 切削
-            
+            gc.append(f"{G1} Z{target_z:.3f}")
             if target_z > z_final:
-                # 切り粉排出（リトラクト）
-                gc.append(f"{G0} Z{z_start + 0.5}") # 穴の外へ一旦出る
-                gc.append(f"{G0} Z{target_z + 0.5}") # 戻る（少し手前まで）
-                
+                gc.append(f"{G0} Z{z_start + 0.5}")
+                gc.append(f"{G0} Z{target_z + 0.5}")
             current_z = target_z
-            
-        gc.append(f"{G0} Z{safe}") # 安全高さへ
-        
+        gc.append(f"{G0} Z{safe}")
     gc.append(footer.strip())
     return "\n".join(gc)
 
@@ -368,19 +339,18 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 3.0: ドリル加工(穴あけ) 対応版")
+st.caption("Ver 3.1: 工具径制限解除・ドリル対応・インデント修正版")
 
 with st.sidebar:
     st.header("📍 原点設定")
     origin = st.radio("加工原点 (0,0)", ["Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"], index=0)
     st.divider()
     
-    # ★ タブに「ドリル」を追加
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
-   with tab1:
+    with tab1:
         st.subheader("エンドミル (ポケット)")
-        # max_value=None で上限撤廃、format="%.3f" で3.175mmなども入力可能に
+        # max_value=None で上限撤廃
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
@@ -407,12 +377,12 @@ with st.sidebar:
         feed_v = st.number_input("送り速度 (mm/min)", 300, step=50, key="fv")
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
 
-    # ★ ドリル設定UI
     with tab4:
         st.subheader("ドリル加工 (穴あけ)")
-        drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, step=0.1, help="DXF内でこの直径を持つ円だけを穴あけします")
+        # max_value=None で上限撤廃
+        drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f", help="DXF内でこの直径を持つ円だけを穴あけします")
         drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
-        peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5, help="1回に掘り進む深さ。深く掘る場合に切り粉を排出します")
+        peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5, help="1回に掘り進む深さ")
         feed_d = st.number_input("送り速度 (mm/min)", 200, step=50, key="fd")
         st.info("※DXF内で「円」として描かれた図形、または正方形に近いポリゴンを検出します。")
 
@@ -473,7 +443,7 @@ if f:
                     v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
             gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
             
-            # 4. ドリル (新規)
+            # 4. ドリル
             drill_pts = find_drill_points(geom, drill_dia_target)
             gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
