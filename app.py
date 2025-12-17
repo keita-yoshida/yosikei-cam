@@ -378,9 +378,10 @@ with st.sidebar:
     # ★ タブに「ドリル」を追加
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
-    with tab1:
+   with tab1:
         st.subheader("エンドミル (ポケット)")
-        dia = st.number_input("工具径 (mm)", 3.0, step=0.1)
+        # max_value=None で上限撤廃、format="%.3f" で3.175mmなども入力可能に
+        dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
         step = st.slider("ステップオーバー (%)", 10, 90, 50) / 100.0
