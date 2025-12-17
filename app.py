@@ -1,6 +1,7 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import tempfile
 import os
 import math
@@ -86,9 +87,11 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """ドッグボーン適用"""
+    """ドッグボーン適用 (頂点拡張方式)"""
     if polygon.is_empty: return polygon
-    poly = polygon.simplify(0.001)
+    
+    # 形状の微細なノイズのみ除去 (角を丸めないよう許容値を極小に)
+    poly = polygon.simplify(0.0001)
     if poly.geom_type != 'Polygon': return polygon
     
     coords = list(poly.exterior.coords)
@@ -113,26 +116,34 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         v1 /= n1
         v2 /= n2
         
+        # 角度計算
         cross = np.cross(v1, v2)
         dot = np.dot(v1, v2)
         angle = math.degrees(math.atan2(cross, dot))
         
+        # 直線以外(5度以上の曲がり)かつ、内角側の凸部に対して処理
+        # 菱形のような鋭角(30度)も、六角形(120度)もカバー
         if abs(angle) > 5:
             bisector = v2 - v1
             bn = np.linalg.norm(bisector)
             if bn > 1e-6:
                 bisector /= bn
+                
+                # ベクトルが「ポリゴンの内側」を向くように調整
+                # (ドッグボーンは母材＝ポリゴン を削り広げるものなので、中心はポリゴン内にあるべき)
                 test_pt = p_curr + bisector * 0.01
-                direction_is_outward = not poly.contains(Point(test_pt))
-                if not direction_is_outward:
+                if not poly.contains(Point(test_pt)):
                     bisector = -bisector
                 
+                # 配置位置: 頂点から内側へ
                 dist = r * overcut_ratio
                 center = p_curr + bisector * dist
+                
                 circle = Point(center).buffer(r, resolution=16)
                 dogbone_circles.append(circle)
 
     if not dogbone_circles: return polygon
+    
     try:
         return unary_union([polygon] + dogbone_circles).simplify(0.001)
     except:
@@ -141,10 +152,11 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
 def apply_dogbone(geometry, tool_dia):
     polys = ensure_list_of_polys(geometry)
     if not polys: return geometry
+    # 外形(Polygon)ごとに適用
     new_parts = [apply_dogbone_single(p, tool_dia) for p in polys]
     return unary_union(new_parts)
 
-# --- 2. データ読み込み ---
+# --- 2. データ読み込み (XOR処理に変更) ---
 
 def dxf_to_shapely(dxf_bytes):
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
@@ -158,7 +170,6 @@ def dxf_to_shapely(dxf_bytes):
             if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE', 'CIRCLE'):
                 try:
                     if e.dxftype() == 'CIRCLE':
-                        # 円は多角形近似
                         center = e.dxf.center
                         radius = e.dxf.radius
                         poly = Point(center[:2]).buffer(radius, resolution=64)
@@ -175,28 +186,59 @@ def dxf_to_shapely(dxf_bytes):
                             clean = make_valid(poly)
                             if clean.area > 0.01: polys.append(clean)
                 except: pass
+        
         if not polys: return None
-        return unary_union(polys)
+        
+        # ★★★ 修正: 単純結合(Union)ではなく、XOR(Symmetric Difference)で結合する ★★★
+        # これにより、「枠の中にある円」は「穴」として認識されるようになります。
+        
+        # 面積の大きい順にソート (大きい枠から順に処理すると安定する)
+        polys.sort(key=lambda x: x.area, reverse=True)
+        
+        combined = Polygon()
+        for p in polys:
+            if combined.is_empty:
+                combined = p
+            else:
+                combined = combined.symmetric_difference(p)
+                
+        return combined
     except Exception as e:
         st.error(f"DXF Read Error: {e}")
         return None
     finally:
         if os.path.exists(tmp_path): os.unlink(tmp_path)
 
-# --- 3. ドリル穴検出ロジック ---
+# --- 3. ドリル穴検出ロジック (穴＝Interiorsにも対応) ---
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
     polys = ensure_list_of_polys(geometry)
     drill_points = []
-    for p in polys:
+    
+    target_r = target_dia / 2.0
+    
+    def check_poly(p):
         minx, miny, maxx, maxy = p.bounds
         w = maxx - minx
         h = maxy - miny
-        if abs(w - h) > tolerance: continue
-        if not (target_dia - tolerance <= w <= target_dia + tolerance): continue
+        if abs(w - h) > tolerance: return None
+        if not (target_dia - tolerance <= w <= target_dia + tolerance): return None
         expected_area = math.pi * ((w/2)**2)
-        if abs(p.area - expected_area) / expected_area > 0.15: continue
-        drill_points.append(p.centroid)
+        # 許容誤差を少し緩めに(20%)
+        if abs(p.area - expected_area) / expected_area > 0.2: return None
+        return p.centroid
+
+    for p in polys:
+        # 1. 外形が円の場合 (ただの円)
+        pt = check_poly(p)
+        if pt: drill_points.append(pt)
+        
+        # 2. ★中抜き穴(Interior)が円の場合 (菱形の中の丸など)
+        for interior in p.interiors:
+            hole_poly = Polygon(interior)
+            pt = check_poly(hole_poly)
+            if pt: drill_points.append(pt)
+            
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -339,7 +381,7 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 3.1: 工具径制限解除・ドリル対応・インデント修正版")
+st.caption("Ver 3.2: 菱形/六角形ドッグボーン完全対応・中抜きドリル対応")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -350,7 +392,6 @@ with st.sidebar:
     
     with tab1:
         st.subheader("エンドミル (ポケット)")
-        # max_value=None で上限撤廃
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
@@ -379,12 +420,11 @@ with st.sidebar:
 
     with tab4:
         st.subheader("ドリル加工 (穴あけ)")
-        # max_value=None で上限撤廃
         drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f", help="DXF内でこの直径を持つ円だけを穴あけします")
         drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
         peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5, help="1回に掘り進む深さ")
         feed_d = st.number_input("送り速度 (mm/min)", 200, step=50, key="fd")
-        st.info("※DXF内で「円」として描かれた図形、または正方形に近いポリゴンを検出します。")
+        st.info("※図形の中にある円（穴）も検出します。")
 
     st.divider()
     pp_name = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys()))
@@ -428,29 +468,24 @@ if f:
             st.header("2. パス生成")
             
             # --- 計算処理 ---
-            # 1. ポケット
             p_paths = generate_pocket(geom, dia, clear, step, use_dogbone)
             gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
             
-            # 2. 面取り
             c_paths = generate_chamfer(geom, chamfer_w, tip_off)
             gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
             
-            # 3. Vカーブ
             v_paths = []
             if tab3: 
                 with st.spinner("Vカービングパス計算中..."):
                     v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
             gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
             
-            # 4. ドリル
             drill_pts = find_drill_points(geom, drill_dia_target)
             gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             # --- プレビュー ---
             fig2, ax2 = plt.subplots(figsize=(5,5))
             
-            # 元図形(薄く)
             for p in polys:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.15)
                 for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.15)
