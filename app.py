@@ -5,7 +5,7 @@ import tempfile
 import os
 import math
 
-# 幾何学計算ライブラリ
+# 幾何学計算ライブラリ (Shapely)
 from shapely.geometry import Polygon, LineString, Point, MultiPolygon, GeometryCollection
 from shapely.affinity import translate
 from shapely.ops import linemerge, unary_union
@@ -41,33 +41,23 @@ POST_PROCESSORS = {
 
 # --- 1. 幾何学ユーティリティ ---
 
-def ensure_valid_polygons(geometry):
-    """
-    どんな形状データが来ても、必ず「有効なPolygonのリスト」に変換して返す。
-    エラー('NullPolygon'など)の原因をここで排除する。
-    """
+def ensure_list_of_polys(geometry):
+    """どんなGeometryが来ても必ずPolygonのリストにして返す"""
     if geometry is None or geometry.is_empty:
         return []
-    
-    # 無効な形状なら修復を試みる
-    if not geometry.is_valid:
-        geometry = make_valid(geometry)
-
-    polys = []
     if geometry.geom_type == 'Polygon':
-        polys.append(geometry)
+        return [geometry]
     elif geometry.geom_type == 'MultiPolygon':
-        polys.extend(geometry.geoms)
+        return list(geometry.geoms)
     elif geometry.geom_type == 'GeometryCollection':
+        polys = []
         for g in geometry.geoms:
             if g.geom_type == 'Polygon':
                 polys.append(g)
             elif g.geom_type == 'MultiPolygon':
                 polys.extend(g.geoms)
-    
-    # 面積がほぼゼロのゴミを除去
-    clean_polys = [p for p in polys if p.area > 0.001]
-    return clean_polys
+        return polys
+    return []
 
 def dist_lseg(l1, l2, p):
     x0, y0 = l1[0], l1[1]
@@ -91,16 +81,22 @@ def douglas_peucker(points, tolerance):
             index = i
             dmax = d
     if dmax > tolerance:
-        return douglas_peucker(points[:index+1], tolerance)[:-1] + douglas_peucker(points[index:], tolerance)
+        rec_results1 = douglas_peucker(points[:index+1], tolerance)
+        rec_results2 = douglas_peucker(points[index:], tolerance)
+        return rec_results1[:-1] + rec_results2
     else:
         return [points[0], points[end]]
 
+# ★★★ 改良版ドッグボーン生成ロジック ★★★
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """ドッグボーン適用（高感度版）"""
+    """
+    角の逃げ（ドッグボーン）処理
+    アクリル等の嵌め合いのために、内角の頂点から外側へドリル穴を追加する
+    """
     if polygon.is_empty: return polygon
     
-    # 形状を整える
-    poly = polygon.simplify(0.001)
+    # ノイズ除去は最小限にする（角を丸めないため）
+    poly = polygon.simplify(0.0001)
     if poly.geom_type != 'Polygon': return polygon
     
     coords = list(poly.exterior.coords)
@@ -109,6 +105,10 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     num_pts = len(coords)
     dogbone_circles = []
     r = tool_dia / 2.0
+    
+    # 確実に角を落とすためのオーバーカット係数
+    # 1.0だとぴったり、少し大きくすると確実
+    overcut_ratio = 1.05 
     
     for i in range(num_pts):
         p_curr = np.array(coords[i])
@@ -120,75 +120,72 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         
         n1 = np.linalg.norm(v1)
         n2 = np.linalg.norm(v2)
-        if n1 < 1e-5 or n2 < 1e-5: continue
+        if n1 < 1e-6 or n2 < 1e-6: continue
         v1 /= n1
         v2 /= n2
         
-        # 外積で内角判定
+        # 角度計算
         cross = np.cross(v1, v2)
         dot = np.dot(v1, v2)
         angle = math.degrees(math.atan2(cross, dot))
         
-        # ★修正: 判定範囲を大幅に拡大 (10度〜170度)
-        # これにより菱形の鋭角(30度など)や六角形(120度)も全て対象にする
-        # Shapelyの標準的な外周は反時計回り。左折が凸、右折が凹(内角)。
-        # ここでは「曲がっている角」すべてに対して、内側への逃げを検討する
-        
-        # 内側への曲がり（凹角＝ポケットの隅）を検出
-        # 時計回りのデータの場合もあるため、絶対値や符号に頼りすぎず、
-        # 「角の二等分線方向に少し進んで、ポリゴン内部なら内角」と判定する
-        
-        if 5 < abs(angle) < 175: # ほぼ一直線以外はすべてチェック
-            # 二等分線ベクトル (外向きか内向きかはまだ不明)
-            bisector = -v1 + v2
+        # 判定: 直線(0度)以外の「曲がっている角」はすべてチェック対象にする
+        # 特にポケット加工の場合、あらゆる凸角（内側に突き出た角）が干渉の原因になる
+        if abs(angle) > 5: # 5度以上曲がっていれば処理対象
+            
+            # 二等分線ベクトルを計算
+            # (v2 - v1) は角の「外側」を向くベクトルになる
+            bisector = v2 - v1
             bn = np.linalg.norm(bisector)
-            if bn > 1e-5:
+            
+            if bn > 1e-6:
                 bisector /= bn
                 
-                # 判定: 頂点からごくわずかに二等分線方向に進んだ点が、ポリゴンの「内側」にあるか？
-                # 内側にあるなら、そこは「ポケットの隅」なのでドッグボーンが必要
+                # 【重要】ベクトルの向き判定
+                # ポケット加工(穴)の場合、「穴の外側へ向かう方向」に逃げを作りたい。
+                # 頂点からわずかにbisector方向に進んだ点が、ポリゴンの「外」であれば正解。
                 test_pt = p_curr + bisector * 0.01
-                is_inner_corner = poly.contains(Point(test_pt))
                 
-                # もし内側でなければ、逆方向（-bisector）が内側か確認（データの回り順対策）
-                if not is_inner_corner:
-                    test_pt_rev = p_curr - bisector * 0.01
-                    if poly.contains(Point(test_pt_rev)):
-                        is_inner_corner = True
-                        bisector = -bisector
+                # Shapelyの contains は境界を含む場合があるため注意
+                # 穴加工なので、「ポリゴンの外」＝「削るべき領域の外（残すべき母材）」
+                # ドッグボーンは「削る領域（ポリゴン）」を「拡張」するもの。
+                # なので、拡張する方向（円を置く方向）は、元のポリゴンの「外」でなければならない。
                 
-                if is_inner_corner:
-                    # ここは削るべき隅である
-                    # 配置位置: 頂点から内側へ少し入った位置
-                    # 90度なら r*(sqrt(2)-1) だが、鋭角だと中心をもっと奥にしないといけない
-                    # 簡易的に、rの50%程度内側に入れれば大抵の角は落ちる
-                    offset = r * 0.5
-                    center = p_curr + bisector * offset
-                    
-                    # 円を作成
-                    circle = Point(center).buffer(r, resolution=16)
-                    dogbone_circles.append(circle)
+                direction_is_outward = not poly.contains(Point(test_pt))
+                
+                # もし内側を向いていたら反転させる
+                if not direction_is_outward:
+                    bisector = -bisector
+                
+                # 配置位置の計算
+                # ユーザー提案:「中心から外側に1本飛び出る形」
+                # これを実現するには、角の頂点から半径Rの距離に円の中心を置けば、
+                # 円周がちょうど頂点を通る形になる。
+                # 確実に頂点をクリアするために、ほんの少し(overcut_ratio)奥に配置する。
+                dist = r * overcut_ratio
+                center = p_curr + bisector * dist
+                
+                # 円を生成して追加
+                # resolution=16 で十分滑らか
+                circle = Point(center).buffer(r, resolution=16)
+                dogbone_circles.append(circle)
 
     if not dogbone_circles:
         return polygon
         
-    # 合成
+    # 元の形状とドッグボーン穴を結合 (Union)
     try:
         combined = unary_union([polygon] + dogbone_circles)
-        return combined
+        return combined.simplify(0.001)
     except:
         return polygon
 
 def apply_dogbone(geometry, tool_dia):
-    polys = ensure_valid_polygons(geometry)
+    polys = ensure_list_of_polys(geometry)
     if not polys: return geometry
     
-    # 各パーツごとにドッグボーン処理
-    processed = []
-    for p in polys:
-        processed.append(apply_dogbone_single(p, tool_dia))
-        
-    return unary_union(processed)
+    new_parts = [apply_dogbone_single(p, tool_dia) for p in polys]
+    return unary_union(new_parts)
 
 # --- 2. データ読み込み ---
 
@@ -205,15 +202,14 @@ def dxf_to_shapely(dxf_bytes):
             if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE'):
                 try:
                     p = ezdxf.path.make_path(e)
-                    # 読み込み精度
-                    pts = list(p.flattening(0.02))
+                    pts = list(p.flattening(0.01))
                     if len(pts) > 2:
                         poly = Polygon([(v.x, v.y) for v in pts])
-                        if poly.is_valid and poly.area > 0.5:
+                        if poly.is_valid and poly.area > 0.1:
                             polys.append(poly)
                         elif not poly.is_valid:
                             clean = make_valid(poly)
-                            if clean.area > 0.5: polys.append(clean)
+                            if clean.area > 0.1: polys.append(clean)
                 except: pass
         
         if not polys: return None
@@ -230,24 +226,24 @@ def dxf_to_shapely(dxf_bytes):
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     work_geom = geometry
-    # ドッグボーン処理 (元形状自体を変更して膨らませる)
+    # ★重要: まずドッグボーンで形状自体を拡張する
     if dogbone:
         work_geom = apply_dogbone(work_geom, tool_d)
     
     paths = []
     r = tool_d / 2.0
-    offset_dist = -(r - clearance)
+    offset_dist = -(r - clearance) # 内側へ
     
     try:
-        current = work_geom.buffer(offset_dist, join_style=2)
+        # ドッグボーン適用後の形状に対してオフセットを開始
+        current = work_geom.buffer(offset_dist, join_style=2) # 2=Miter
     except:
         return []
 
     step = tool_d * stepover
     
-    # ループ処理 (エラー回避強化)
     while not current.is_empty and current.area > 0.01:
-        current_polys = ensure_valid_polygons(current)
+        current_polys = ensure_list_of_polys(current)
         if not current_polys: break
 
         for p in current_polys:
@@ -263,7 +259,7 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
 
 def generate_chamfer(geometry, width, tip_offset):
     offset = tip_offset
-    polys = ensure_valid_polygons(geometry)
+    polys = ensure_list_of_polys(geometry)
     
     if offset <= 0:
         paths = []
@@ -274,8 +270,7 @@ def generate_chamfer(geometry, width, tip_offset):
     
     try:
         p = geometry.buffer(offset, join_style=1) # 1=Round
-        p_list = ensure_valid_polygons(p)
-        
+        p_list = ensure_list_of_polys(p)
         paths = []
         for poly in p_list:
             paths.append(poly.exterior)
@@ -285,13 +280,11 @@ def generate_chamfer(geometry, width, tip_offset):
         return []
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
-    polys = ensure_valid_polygons(geometry)
+    polys = ensure_list_of_polys(geometry)
     all_paths = []
-    
     tan_a = np.tan(np.radians(angle_deg/2))
 
     for poly in polys:
-        # 高速化のため少し単純化
         simple = poly.simplify(0.05)
         line = simple.exterior
         length = line.length
@@ -313,7 +306,6 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
             if p1i < 0 or p2i < 0: continue
             p1 = vor.vertices[p1i]
             p2 = vor.vertices[p2i]
-            
             if simple.contains(Point(p1)) and simple.contains(Point(p2)):
                 segments.append(LineString([p1, p2]))
         
@@ -334,10 +326,8 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
                 pt = l.interpolate(i * step_len)
                 d = line.distance(pt)
                 z = -(d / tan_a)
-                
                 if use_limit:
                     if z < max_d: z = max_d
-                    
                 l_pts.append((pt.x, pt.y, z))
             
             if len(l_pts) > 1:
@@ -378,9 +368,9 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 # --- 4. UI ---
 
-st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("yosikeiCAM")
-st.caption("Ver 2.2: 菱形/六角形ドッグボーン対応・凡例表示・深さ制限修正")
+st.set_page_config(page_title="Multi-Path CAM", layout="wide")
+st.title("⚡ Multi-Path CAM")
+st.caption("Ver 2.3: 強力ドッグボーン搭載・アクリル嵌め合い対応")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -391,11 +381,12 @@ with st.sidebar:
     
     with tab1:
         st.subheader("エンドミル (ポケット)")
-        dia = st.number_input("工具径 (mm)", 0.1, step=0.1)
+        dia = st.number_input("工具径 (mm)", 3.0, step=0.1)
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
         step = st.slider("ステップオーバー (%)", 10, 90, 50) / 100.0
-        use_dogbone = st.checkbox("ドッグボーン (角逃げ)", True, help="鋭角も鈍角もしっかりえぐります")
+        # ★ ドッグボーンの説明を明確化
+        use_dogbone = st.checkbox("ドッグボーン (角逃げ)", True, help="すべての角にドリル穴を追加して、アクリルの角が入るようにします")
         feed_p = st.number_input("送り速度 (mm/min)", 300, step=50, key="fp")
         
     with tab2:
@@ -410,7 +401,7 @@ with st.sidebar:
         st.subheader("Vカービング (彫刻)")
         v_ang = st.number_input("Vビット角度 (度)", 60.0, step=10.0)
         
-        # ★★★ 修正: 深さ制限のチェックボックス ★★★
+        # 深さ制限チェックボックス
         use_v_limit = st.checkbox("深さ制限を有効にする", value=False)
         if use_v_limit:
             v_lim = st.number_input("最大深さ制限 (mm)", value=-3.0, max_value=0.0, step=0.1)
@@ -435,78 +426,4 @@ if f:
     
     if geom and not geom.is_empty:
         minx, miny, maxx, maxy = geom.bounds
-        w, h = maxx-minx, maxy-miny
-        
-        if origin == "Bottom-Left":
-            geom = translate(geom, -minx, -miny)
-        elif origin == "Center":
-            geom = translate(geom, -(minx+w/2), -(miny+h/2))
-            
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
-            fig, ax = plt.subplots(figsize=(5,5))
-            
-            # 元図形の描画
-            polys = ensure_valid_polygons(geom)
-            for i, p in enumerate(polys):
-                label = "Original" if i == 0 else ""
-                ax.plot(*p.exterior.xy, 'k', linewidth=1.5, label=label)
-                for interior in p.interiors: ax.plot(*interior.xy, 'k', linewidth=1.5)
-                    
-            ax.axis('equal')
-            ax.grid(True, linestyle=':', alpha=0.5)
-            ax.legend()
-            st.pyplot(fig)
-            
-        with c2:
-            st.header("2. パス生成")
-            
-            # パス計算
-            p_paths = generate_pocket(geom, dia, clear, step, use_dogbone)
-            c_paths = generate_chamfer(geom, chamfer_w, tip_off)
-            
-            v_paths = []
-            if tab3: 
-                with st.spinner("Vカービングパス計算中..."):
-                    v_paths = generate_vcarve(geom, v_ang, use_v_limit, v_lim, v_res)
-
-            # Gコード生成
-            gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
-            gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
-            gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
-            
-            # --- プレビュー (色分け & 凡例付き) ---
-            fig2, ax2 = plt.subplots(figsize=(5,5))
-            
-            # 元図形(薄く)
-            for p in polys:
-                ax2.plot(*p.exterior.xy, 'k--', alpha=0.15)
-                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.15)
-            
-            # 凡例用ダミープロット (各色1回だけ登録)
-            ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
-            ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
-            ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
-
-            # 実プロット
-            if p_paths:
-                for ls in p_paths: ax2.plot(*ls.xy, color='tab:blue', alpha=0.9, linewidth=1.0)
-            if c_paths:
-                for ls in c_paths: ax2.plot(*ls.xy, color='tab:green', alpha=0.9, linewidth=1.0)
-            if v_paths:
-                for pts in v_paths:
-                    ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='tab:red', linewidth=0.8)
-            
-            ax2.legend(loc='upper right', framealpha=0.9)
-            ax2.axis('equal')
-            st.pyplot(fig2)
-            
-            # ダウンロードボタン
-            b1, b2, b3 = st.columns(3)
-            if gc_p: b1.download_button("📥 POCKET.nc", gc_p, "pocket.nc")
-            if gc_c: b2.download_button("📥 CHAMFER.nc", gc_c, "chamfer.nc")
-            if gc_v: b3.download_button("📥 VCARVE.nc", gc_v, "vcarve.nc")
-            
-    else:
-        st.error("有効な閉じた図形が見つかりません。")
+        w
