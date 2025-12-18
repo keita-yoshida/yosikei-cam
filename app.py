@@ -166,7 +166,6 @@ def dxf_to_shapely_list(dxf_bytes):
                     
                     if 'poly' in locals():
                         if poly.is_valid:
-                            # 面積0の完全なゴミは除外するが、小さい穴は残す
                             if poly.area > 0.0001: 
                                 polys.append(poly)
                         elif not poly.is_valid:
@@ -194,7 +193,6 @@ def merge_polygons_xor(polys):
 # --- 3. ドリル解析 ---
 
 def analyze_holes(geometry):
-    """存在する円の直径をリストアップする"""
     polys = ensure_list_of_polys(geometry)
     sizes = []
     
@@ -202,10 +200,10 @@ def analyze_holes(geometry):
         minx, miny, maxx, maxy = p.bounds
         w = maxx - minx
         h = maxy - miny
-        if abs(w - h) > 0.1: return None # 正方形チェック
+        if abs(w - h) > 0.1: return None 
         expected_area = math.pi * ((w/2)**2)
         if abs(p.area - expected_area) / expected_area > 0.2: return None
-        return w # 直径を返す
+        return w 
 
     for p in polys:
         d = check_poly(p)
@@ -381,13 +379,14 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.5: ゴミ対策(選択パス基準原点)・ドリル解析")
+st.caption("Ver 4.6: 原点自動補正・全図形基準版")
 
 with st.sidebar:
     st.header("📍 原点設定")
-    origin = st.radio("加工原点", ["Bottom-Left (選択図形の左下)", "Center (選択図形の中心)", "Original (CAD座標)"], index=0)
-    st.divider()
+    # デフォルトを左下基準(自動補正)に設定
+    origin = st.radio("原点基準", ["Bottom-Left (全図形の左下)", "Center (全図形の中心)", "Original (CAD座標)"], index=0, help="Bottom-Left: 全ての図形を含む範囲の左下を(0,0)に自動補正します。")
     
+    st.divider()
     st.header("⚙️ 加工設定")
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
@@ -443,45 +442,41 @@ if f:
     polys_raw = dxf_to_shapely_list(f.getvalue())
     
     if polys_raw:
-        # 1. パス選択UI (先に選択させる)
-        st.sidebar.divider()
-        st.sidebar.subheader("📐 パス選択 (ゴミ除去)")
+        # ★★★ 原点自動補正ロジック ★★★
+        # 1. 全図形の結合範囲を取得
+        temp_union = unary_union(polys_raw)
+        minx, miny, maxx, maxy = temp_union.bounds
+        w, h = maxx-minx, maxy-miny
         
-        selected_indices = []
-        container = st.sidebar.container()
-        all_checked = container.checkbox("すべて選択", value=True)
-        
-        for i, p in enumerate(polys_raw):
-            # 面積と中心座標を表示してゴミ判別しやすくする
-            cx, cy = p.centroid.x, p.centroid.y
-            label = f"Path #{i+1} (Area:{p.area:.2f}, Pos:{cx:.0f},{cy:.0f})"
-            is_checked = container.checkbox(label, value=all_checked, key=f"p_{i}")
-            if is_checked: selected_indices.append(i)
-        
-        target_polys_raw = [polys_raw[i] for i in selected_indices]
-        
-        # 2. 原点計算 (選択されたものだけを基準にする)
-        if target_polys_raw:
-            temp_union = unary_union(target_polys_raw)
-            minx, miny, maxx, maxy = temp_union.bounds
-            w, h = maxx-minx, maxy-miny
-        else:
-            minx, miny, w, h = 0, 0, 0, 0
-            
+        # 2. 補正量計算 (全図形基準)
         offset_x, offset_y = 0, 0
         if origin.startswith("Bottom-Left"):
             offset_x, offset_y = -minx, -miny
         elif origin.startswith("Center"):
             offset_x, offset_y = -(minx+w/2), -(miny+h/2)
             
-        # 3. 座標変換
-        # 表示用: 全て移動
-        polys_moved_all = [translate(p, offset_x, offset_y) for p in polys_raw]
-        # 計算用: 選択されたものだけ移動して結合
-        target_polys_moved = [polys_moved_all[i] for i in selected_indices]
-        geom_for_calc = merge_polygons_xor(target_polys_moved)
+        # 3. 全データを補正 (これがデフォルト状態になる)
+        polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
         
-        # --- ドリル穴解析 (ヒント表示) ---
+        # 4. パス選択UI
+        st.sidebar.divider()
+        st.sidebar.subheader("📐 パス選択")
+        
+        selected_indices = []
+        container = st.sidebar.container()
+        all_checked = container.checkbox("すべて選択", value=True)
+        
+        for i, p in enumerate(polys_moved):
+            cx, cy = p.centroid.x, p.centroid.y
+            label = f"Path #{i+1} (Area:{p.area:.1f})"
+            is_checked = container.checkbox(label, value=all_checked, key=f"p_{i}")
+            if is_checked: selected_indices.append(i)
+        
+        # 加工対象の抽出
+        target_polys = [polys_moved[i] for i in selected_indices]
+        geom_for_calc = merge_polygons_xor(target_polys)
+        
+        # --- ドリル穴解析 (ヒント) ---
         if geom_for_calc:
             drill_sizes = analyze_holes(geom_for_calc)
             if drill_sizes:
@@ -494,14 +489,14 @@ if f:
             st.success(f"加工サイズ: {w:.1f} x {h:.1f} mm")
             fig, ax = plt.subplots(figsize=(5,5))
             
-            # 原点マーカー
-            ax.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
+            # 原点マーカー (0,0) を明示
+            ax.plot(0, 0, 'r+', markersize=20, markeredgewidth=2, zorder=10, label="原点 (0,0)")
             ax.axhline(0, color='red', linewidth=0.5, alpha=0.5)
             ax.axvline(0, color='red', linewidth=0.5, alpha=0.5)
 
-            for i, p in enumerate(polys_moved_all):
-                style = 'k-' if i in selected_indices else 'k:' # 非選択は点線
-                alpha = 1.0 if i in selected_indices else 0.1   # 非選択は薄く
+            for i, p in enumerate(polys_moved):
+                style = 'k-' if i in selected_indices else 'k:'
+                alpha = 1.0 if i in selected_indices else 0.1
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
                 for interior in p.interiors: 
                     ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
@@ -512,6 +507,7 @@ if f:
 
             ax.axis('equal')
             ax.grid(True, linestyle=':', alpha=0.5)
+            ax.legend(loc='lower right')
             st.pyplot(fig)
             
         with c2:
@@ -540,7 +536,12 @@ if f:
                     gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
-            for p in target_polys_moved: # 選択されたものだけ描画
+            # 原点マーカー (結果側にも)
+            ax2.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
+            ax2.axhline(0, color='red', linewidth=0.5, alpha=0.5)
+            ax2.axvline(0, color='red', linewidth=0.5, alpha=0.5)
+
+            for p in polys_moved:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
                 for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
             
