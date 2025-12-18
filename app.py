@@ -86,8 +86,8 @@ def douglas_peucker(points, tolerance):
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     """
-    ドッグボーン適用 (頂点拡張方式・改良版)
-    すべての角(鋭角・鈍角)に対して、頂点を通過する円を配置して合成する
+    ドッグボーン適用 (頂点拡張方式・鋭角対応版)
+    角度に応じて円の食い込み量を自動調整する
     """
     if polygon.is_empty: return polygon
     
@@ -95,69 +95,87 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     poly = polygon.simplify(0.001)
     if poly.geom_type != 'Polygon': return polygon
     
-    coords = list(poly.exterior.coords)
-    if coords[0] == coords[-1]: coords.pop()
-    
-    num_pts = len(coords)
+    # 外周と内周（穴）をすべて処理対象にする
+    rings = [poly.exterior] + list(poly.interiors)
     dogbone_circles = []
     r = tool_dia / 2.0
     
-    # 確実に角を落とすために、半径の1.05倍の距離に中心を置く（5%食い込ませる）
-    overcut_ratio = 1.05
-    
-    for i in range(num_pts):
-        p_curr = np.array(coords[i])
-        p_prev = np.array(coords[(i - 1) % num_pts])
-        p_next = np.array(coords[(i + 1) % num_pts])
+    for ring in rings:
+        coords = list(ring.coords)
+        if coords[0] == coords[-1]: coords.pop()
+        num_pts = len(coords)
         
-        v1 = p_curr - p_prev
-        v2 = p_next - p_curr
-        
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6: continue
-        v1 /= n1
-        v2 /= n2
-        
-        # 角度計算
-        cross = np.cross(v1, v2)
-        dot = np.dot(v1, v2)
-        angle = math.degrees(math.atan2(cross, dot))
-        
-        # ほぼ一直線(0度付近)以外はすべてドッグボーンの対象とする (5度〜175度)
-        if abs(angle) > 5 and abs(angle) < 175:
+        for i in range(num_pts):
+            p_curr = np.array(coords[i])
+            p_prev = np.array(coords[(i - 1) % num_pts])
+            p_next = np.array(coords[(i + 1) % num_pts])
             
-            # 二等分線ベクトル (外向きの角の二等分線)
-            # v2 - v1 は、角の「外側」を向くベクトル
-            bisector = v2 - v1
-            bn = np.linalg.norm(bisector)
+            v1 = p_curr - p_prev
+            v2 = p_next - p_curr
             
-            if bn > 1e-6:
-                bisector /= bn
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6: continue
+            v1 /= n1
+            v2 /= n2
+            
+            # 角度計算
+            cross = np.cross(v1, v2)
+            dot = np.dot(v1, v2)
+            angle_deg = math.degrees(math.atan2(cross, dot))
+            
+            # ほぼ直線(0度付近)以外はすべて対象にする (5度〜175度)
+            # これにより鋭角(30度)も鈍角(150度)もすべて拾う
+            if 5 < abs(angle_deg) < 175:
                 
-                # 「ポケット加工」なので、ポリゴンの「内側」に向かってドリルを入れたい。
-                # 頂点からわずかにbisector方向に進んだ点が、ポリゴンの「内部」かチェック
-                test_pt = p_curr + bisector * 0.01
+                # 二等分線ベクトル (外向きの角の二等分線)
+                bisector = v2 - v1
+                bn = np.linalg.norm(bisector)
                 
-                # containsは境界を含む場合があるので注意深いが、simplify済みなので概ねOK
-                is_inward = poly.contains(Point(test_pt))
-                
-                # もし外側を向いていたら反転させる（内側に向ける）
-                if not is_inward:
-                    bisector = -bisector
-                
-                # 配置位置: 頂点から内側へ 半径R 分だけ進んだ位置
-                # これにより、円周がちょうど頂点を通る
-                dist = r * overcut_ratio
-                center = p_curr + bisector * dist
-                
-                # 円を作成して追加
-                circle = Point(center).buffer(r, resolution=16)
-                dogbone_circles.append(circle)
+                if bn > 1e-6:
+                    bisector /= bn
+                    
+                    # ポケット加工（穴を広げる）なので、
+                    # ポリゴンの「削られる側（内部）」に向かって円を置きたい。
+                    test_pt = p_curr + bisector * 0.01
+                    is_inside = poly.contains(Point(test_pt)) # 内部判定
+                    
+                    # Exterior(外周)の場合: 内側に向ける
+                    # Interior(穴)の場合: 穴の中(ポリゴン的には外部)に向ける必要はない。
+                    # Interiorは「残す島」ではなく「削る穴の境界」なので、
+                    # 削る領域（ポリゴン内部）に向かってドッグボーンを入れるのが正解。
+                    
+                    # 結論: 常に「ポリゴンの内部（削る領域）」に向ける
+                    if not is_inside:
+                        bisector = -bisector
+                    
+                    # 配置位置の計算 (重要: 鋭角対策)
+                    # 角度が鋭いほど、浅い位置では刃物が角に届かない。
+                    # 角の半角 theta = (180 - |angle|) / 2
+                    # 必要な食い込み距離 d = r / sin(theta)
+                    # これで円周が頂点に接する。
+                    # さらに余裕を持たせるため overcut 倍する。
+                    
+                    half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
+                    if half_angle_rad < 0.1: half_angle_rad = 0.1 # ゼロ除算防止
+                    
+                    # 理論上の接点距離
+                    dist_theoretical = r / math.sin(half_angle_rad)
+                    
+                    # 中心位置 = 頂点から内側へ (dist_theoretical - r)
+                    # これで円周が頂点を通る
+                    offset = (dist_theoretical - r) + (r * 0.05) # +5%余裕
+                    
+                    center = p_curr + bisector * offset
+                    
+                    # 円を作成して追加
+                    circle = Point(center).buffer(r, resolution=16)
+                    dogbone_circles.append(circle)
 
     if not dogbone_circles: return polygon
     
     try:
+        # 元の形状と結合
         return unary_union([polygon] + dogbone_circles).simplify(0.001)
     except:
         return polygon
@@ -265,7 +283,7 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     gc.append(footer.strip())
     return "\n".join(gc)
 
-# --- 4. パス生成ロジック (改良版: 荒取り/仕上げ分離) ---
+# --- 4. パス生成ロジック (荒取り/仕上げ分離) ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     paths = []
@@ -273,13 +291,11 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     step = tool_d * stepover
     
     # 1. 荒取り（ドッグボーンなし）
-    # 仕上げ代(clearance) + 1回分のステップオーバー を残して掘る
     offset_rough = -(r - clearance + step)
-    
     try:
         current_rough = geometry.buffer(offset_rough, join_style=2)
     except:
-        current_rough = Polygon() # 失敗したら空
+        current_rough = Polygon()
 
     while not current_rough.is_empty and current_rough.area > 0.01:
         current_polys = ensure_list_of_polys(current_rough)
@@ -291,7 +307,6 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         except: break
 
     # 2. 仕上げ（ドッグボーンあり）
-    # 最外周の1周だけを生成
     work_geom_finish = geometry
     if dogbone:
         work_geom_finish = apply_dogbone(geometry, tool_d)
@@ -301,10 +316,7 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         finish_pass = work_geom_finish.buffer(offset_finish, join_style=2)
         finish_polys = ensure_list_of_polys(finish_pass)
         for p in finish_polys:
-            paths.insert(0, p.exterior) # 仕上げをリストの先頭に追加（描画順序的に）
-                                        # 加工順序としては最後にするのが一般的だが、
-                                        # Gコード生成時に順序制御していないため、
-                                        # ここでは単純にリストに追加。
+            paths.insert(0, p.exterior) # 仕上げを先頭に追加(描画用)
             paths.extend(p.interiors)
     except:
         pass
@@ -406,7 +418,7 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.0: 荒取り/仕上げ分離・ドッグボーン最適化")
+st.caption("Ver 4.1: 鋭角ドッグボーン・荒取り分離 完全版")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -504,7 +516,8 @@ if f:
                 style = 'k-' if i in selected_indices else 'k:'
                 alpha = 1.0 if i in selected_indices else 0.2
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
-                for interior in p.interiors: ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
+                for interior in p.interiors: 
+                    ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
             
             if enable_drill and geom_for_calc:
                  drill_preview = find_drill_points(geom_for_calc, drill_dia_target)
