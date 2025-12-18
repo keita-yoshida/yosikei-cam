@@ -85,97 +85,61 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """
-    ドッグボーン適用 (頂点拡張方式・鋭角対応版)
-    角度に応じて円の食い込み量を自動調整する
-    """
+    """ドッグボーン適用 (頂点拡張方式・鋭角対応版)"""
     if polygon.is_empty: return polygon
     
-    # ノイズ除去
     poly = polygon.simplify(0.001)
     if poly.geom_type != 'Polygon': return polygon
     
-    # 外周と内周（穴）をすべて処理対象にする
-    rings = [poly.exterior] + list(poly.interiors)
+    coords = list(poly.exterior.coords)
+    if coords[0] == coords[-1]: coords.pop()
+    
+    num_pts = len(coords)
     dogbone_circles = []
     r = tool_dia / 2.0
+    overcut_ratio = 1.05 
     
-    for ring in rings:
-        coords = list(ring.coords)
-        if coords[0] == coords[-1]: coords.pop()
-        num_pts = len(coords)
+    for i in range(num_pts):
+        p_curr = np.array(coords[i])
+        p_prev = np.array(coords[(i - 1) % num_pts])
+        p_next = np.array(coords[(i + 1) % num_pts])
         
-        for i in range(num_pts):
-            p_curr = np.array(coords[i])
-            p_prev = np.array(coords[(i - 1) % num_pts])
-            p_next = np.array(coords[(i + 1) % num_pts])
-            
-            v1 = p_curr - p_prev
-            v2 = p_next - p_curr
-            
-            n1 = np.linalg.norm(v1)
-            n2 = np.linalg.norm(v2)
-            if n1 < 1e-6 or n2 < 1e-6: continue
-            v1 /= n1
-            v2 /= n2
-            
-            # 角度計算
-            cross = np.cross(v1, v2)
-            dot = np.dot(v1, v2)
-            angle_deg = math.degrees(math.atan2(cross, dot))
-            
-            # ほぼ直線(0度付近)以外はすべて対象にする (5度〜175度)
-            # これにより鋭角(30度)も鈍角(150度)もすべて拾う
-            if 5 < abs(angle_deg) < 175:
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6: continue
+        v1 /= n1
+        v2 /= n2
+        
+        cross = np.cross(v1, v2)
+        dot = np.dot(v1, v2)
+        angle_deg = math.degrees(math.atan2(cross, dot))
+        
+        if 5 < abs(angle_deg) < 175:
+            bisector = v2 - v1
+            bn = np.linalg.norm(bisector)
+            if bn > 1e-6:
+                bisector /= bn
+                test_pt = p_curr + bisector * 0.01
+                # ポリゴン内部（削る側）に向ける
+                if not poly.contains(Point(test_pt)):
+                    bisector = -bisector
                 
-                # 二等分線ベクトル (外向きの角の二等分線)
-                bisector = v2 - v1
-                bn = np.linalg.norm(bisector)
+                # 鋭角対策の配置位置計算
+                half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
+                if half_angle_rad < 0.1: half_angle_rad = 0.1
                 
-                if bn > 1e-6:
-                    bisector /= bn
-                    
-                    # ポケット加工（穴を広げる）なので、
-                    # ポリゴンの「削られる側（内部）」に向かって円を置きたい。
-                    test_pt = p_curr + bisector * 0.01
-                    is_inside = poly.contains(Point(test_pt)) # 内部判定
-                    
-                    # Exterior(外周)の場合: 内側に向ける
-                    # Interior(穴)の場合: 穴の中(ポリゴン的には外部)に向ける必要はない。
-                    # Interiorは「残す島」ではなく「削る穴の境界」なので、
-                    # 削る領域（ポリゴン内部）に向かってドッグボーンを入れるのが正解。
-                    
-                    # 結論: 常に「ポリゴンの内部（削る領域）」に向ける
-                    if not is_inside:
-                        bisector = -bisector
-                    
-                    # 配置位置の計算 (重要: 鋭角対策)
-                    # 角度が鋭いほど、浅い位置では刃物が角に届かない。
-                    # 角の半角 theta = (180 - |angle|) / 2
-                    # 必要な食い込み距離 d = r / sin(theta)
-                    # これで円周が頂点に接する。
-                    # さらに余裕を持たせるため overcut 倍する。
-                    
-                    half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
-                    if half_angle_rad < 0.1: half_angle_rad = 0.1 # ゼロ除算防止
-                    
-                    # 理論上の接点距離
-                    dist_theoretical = r / math.sin(half_angle_rad)
-                    
-                    # 中心位置 = 頂点から内側へ (dist_theoretical - r)
-                    # これで円周が頂点を通る
-                    offset = (dist_theoretical - r) + (r * 0.05) # +5%余裕
-                    
-                    center = p_curr + bisector * offset
-                    
-                    # 円を作成して追加
-                    circle = Point(center).buffer(r, resolution=16)
-                    dogbone_circles.append(circle)
+                dist_theoretical = r / math.sin(half_angle_rad)
+                offset = (dist_theoretical - r) + (r * 0.05)
+                
+                center = p_curr + bisector * offset
+                circle = Point(center).buffer(r, resolution=16)
+                dogbone_circles.append(circle)
 
     if not dogbone_circles: return polygon
-    
     try:
-        # 元の形状と結合
         return unary_union([polygon] + dogbone_circles).simplify(0.001)
     except:
         return polygon
@@ -290,7 +254,7 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     r = tool_d / 2.0
     step = tool_d * stepover
     
-    # 1. 荒取り（ドッグボーンなし）
+    # 1. 荒取り
     offset_rough = -(r - clearance + step)
     try:
         current_rough = geometry.buffer(offset_rough, join_style=2)
@@ -316,10 +280,9 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         finish_pass = work_geom_finish.buffer(offset_finish, join_style=2)
         finish_polys = ensure_list_of_polys(finish_pass)
         for p in finish_polys:
-            paths.insert(0, p.exterior) # 仕上げを先頭に追加(描画用)
+            paths.insert(0, p.exterior)
             paths.extend(p.interiors)
-    except:
-        pass
+    except: pass
 
     return [LineString(p.coords) for p in paths if p.length > 0.1]
 
@@ -418,7 +381,7 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.1: 鋭角ドッグボーン・荒取り分離 完全版")
+st.caption("Ver 4.2: 刃先オフセット制限撤廃・ファイル名自動設定")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -442,7 +405,8 @@ with st.sidebar:
         enable_chamfer = st.checkbox("面取り加工有効", True)
         st.divider()
         chamfer_w = st.number_input("面取り幅 (mm)", 0.5, step=0.1)
-        tip_off = st.number_input("刃先オフセット (mm)", 1.0, step=0.1)
+        # 刃先オフセットの上限を撤廃 (max_value=None)
+        tip_off = st.number_input("刃先オフセット (mm)", value=1.0, min_value=0.0, max_value=None, step=0.1, format="%.3f")
         feed_c = st.number_input("送り速度 (mm/min)", 300, step=50, key="fc")
         z_c = -(chamfer_w + tip_off)
         st.caption(f"切込深さ: {z_c:.2f}mm")
@@ -478,6 +442,9 @@ st.header("1. DXFアップロード")
 f = st.file_uploader("", type=["dxf"])
 
 if f:
+    # ファイル名から拡張子を除いたベース名を取得
+    base_name = os.path.splitext(f.name)[0]
+    
     polys_raw = dxf_to_shapely_list(f.getvalue())
     
     if polys_raw:
@@ -577,11 +544,12 @@ if f:
             ax2.axis('equal')
             st.pyplot(fig2)
             
+            # ダウンロードボタン (ファイル名自動生成)
             b1, b2, b3, b4 = st.columns(4)
-            if gc_p: b1.download_button("📥 POCKET", gc_p, "pocket.nc")
-            if gc_c: b2.download_button("📥 CHAMFER", gc_c, "chamfer.nc")
-            if gc_v: b3.download_button("📥 VCARVE", gc_v, "vcarve.nc")
-            if gc_d: b4.download_button("📥 DRILL", gc_d, "drill.nc")
+            if gc_p: b1.download_button("📥 POCKET", gc_p, f"{base_name}_pocket.nc")
+            if gc_c: b2.download_button("📥 CHAMFER", gc_c, f"{base_name}_chamfer.nc")
+            if gc_v: b3.download_button("📥 VCARVE", gc_v, f"{base_name}_vcarve.nc")
+            if gc_d: b4.download_button("📥 DRILL", gc_d, f"{base_name}_drill.nc")
             
             if drill_pts:
                 st.success(f"ドリル穴: {len(drill_pts)}箇所 (φ{drill_dia_target}mm)")
