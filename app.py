@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import tempfile
 import os
 import math
+from collections import Counter
 
 # 幾何学計算ライブラリ
 from shapely.geometry import Polygon, LineString, Point, MultiPolygon, GeometryCollection
@@ -85,12 +86,10 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """ドッグボーン適用"""
     if polygon.is_empty: return polygon
     poly = polygon.simplify(0.001)
     if poly.geom_type != 'Polygon': return polygon
     
-    # 外周と穴の両方を処理
     rings = [poly.exterior] + list(poly.interiors)
     dogbone_circles = []
     r = tool_dia / 2.0
@@ -100,21 +99,17 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         coords = list(ring.coords)
         if coords[0] == coords[-1]: coords.pop()
         num_pts = len(coords)
-        
         for i in range(num_pts):
             p_curr = np.array(coords[i])
             p_prev = np.array(coords[(i - 1) % num_pts])
             p_next = np.array(coords[(i + 1) % num_pts])
-            
             v1 = p_curr - p_prev
             v2 = p_next - p_curr
-            
             n1 = np.linalg.norm(v1)
             n2 = np.linalg.norm(v2)
             if n1 < 1e-6 or n2 < 1e-6: continue
             v1 /= n1
             v2 /= n2
-            
             cross = np.cross(v1, v2)
             dot = np.dot(v1, v2)
             angle_deg = math.degrees(math.atan2(cross, dot))
@@ -126,23 +121,19 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
                     bisector /= bn
                     test_pt = p_curr + bisector * 0.01
                     is_inside = poly.contains(Point(test_pt))
-                    if not is_inside:
-                        bisector = -bisector
+                    if not is_inside: bisector = -bisector
                     
                     half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
                     if half_angle_rad < 0.1: half_angle_rad = 0.1
                     dist_theoretical = r / math.sin(half_angle_rad)
                     offset = (dist_theoretical - r) + (r * 0.05)
                     center = p_curr + bisector * offset
-                    
                     circle = Point(center).buffer(r, resolution=16)
                     dogbone_circles.append(circle)
 
     if not dogbone_circles: return polygon
-    try:
-        return unary_union([polygon] + dogbone_circles).simplify(0.001)
-    except:
-        return polygon
+    try: return unary_union([polygon] + dogbone_circles).simplify(0.001)
+    except: return polygon
 
 def apply_dogbone(geometry, tool_dia):
     polys = ensure_list_of_polys(geometry)
@@ -174,11 +165,13 @@ def dxf_to_shapely_list(dxf_bytes):
                             poly = Polygon([(v.x, v.y) for v in pts])
                     
                     if 'poly' in locals():
-                        if poly.is_valid and poly.area > 0.01:
-                            polys.append(poly)
+                        if poly.is_valid:
+                            # 面積0の完全なゴミは除外するが、小さい穴は残す
+                            if poly.area > 0.0001: 
+                                polys.append(poly)
                         elif not poly.is_valid:
                             clean = make_valid(poly)
-                            if clean.area > 0.01: 
+                            if clean.area > 0.0001: 
                                 if clean.geom_type == 'Polygon': polys.append(clean)
                                 elif clean.geom_type == 'MultiPolygon': polys.extend(clean.geoms)
                 except: pass
@@ -198,7 +191,30 @@ def merge_polygons_xor(polys):
         else: combined = combined.symmetric_difference(p)
     return combined
 
-# --- 3. ドリル ---
+# --- 3. ドリル解析 ---
+
+def analyze_holes(geometry):
+    """存在する円の直径をリストアップする"""
+    polys = ensure_list_of_polys(geometry)
+    sizes = []
+    
+    def check_poly(p):
+        minx, miny, maxx, maxy = p.bounds
+        w = maxx - minx
+        h = maxy - miny
+        if abs(w - h) > 0.1: return None # 正方形チェック
+        expected_area = math.pi * ((w/2)**2)
+        if abs(p.area - expected_area) / expected_area > 0.2: return None
+        return w # 直径を返す
+
+    for p in polys:
+        d = check_poly(p)
+        if d: sizes.append(round(d, 2))
+        for interior in p.interiors:
+            d = check_poly(Polygon(interior))
+            if d: sizes.append(round(d, 2))
+            
+    return Counter(sizes)
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
     polys = ensure_list_of_polys(geometry)
@@ -246,14 +262,12 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     gc.append(footer.strip())
     return "\n".join(gc)
 
-# --- 4. パス生成 (荒/仕上げ分離) ---
+# --- 4. パス生成 ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     paths = []
     r = tool_d / 2.0
     step = tool_d * stepover
-    
-    # 荒取り
     offset_rough = -(r - clearance + step)
     try: current_rough = geometry.buffer(offset_rough, join_style=2)
     except: current_rough = Polygon()
@@ -267,7 +281,6 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
 
-    # 仕上げ
     work_geom_finish = geometry
     if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
     offset_finish = -(r - clearance)
@@ -368,18 +381,18 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.3: 原点再計算機能付き")
+st.caption("Ver 4.5: ゴミ対策(選択パス基準原点)・ドリル解析")
 
 with st.sidebar:
     st.header("📍 原点設定")
-    origin = st.radio("加工原点 (0,0)", ["Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"], index=0)
-    
+    origin = st.radio("加工原点", ["Bottom-Left (選択図形の左下)", "Center (選択図形の中心)", "Original (CAD座標)"], index=0)
     st.divider()
+    
     st.header("⚙️ 加工設定")
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
     with tab1:
-        enable_pocket = st.checkbox("ポケット加工有効", True)
+        enable_pocket = st.checkbox("ポケット有効", True)
         st.divider()
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
@@ -389,7 +402,7 @@ with st.sidebar:
         feed_p = st.number_input("送り速度 (mm/min)", 300, step=50, key="fp")
         
     with tab2:
-        enable_chamfer = st.checkbox("面取り加工有効", True)
+        enable_chamfer = st.checkbox("面取り有効", True)
         st.divider()
         chamfer_w = st.number_input("面取り幅 (mm)", 0.5, step=0.1)
         tip_off = st.number_input("刃先オフセット (mm)", value=1.0, min_value=0.0, max_value=None, step=0.1, format="%.3f")
@@ -398,19 +411,17 @@ with st.sidebar:
         st.caption(f"切込深さ: {z_c:.2f}mm")
         
     with tab3:
-        enable_vcarve = st.checkbox("Vカーブ加工有効", False)
+        enable_vcarve = st.checkbox("Vカーブ有効", False)
         st.divider()
         v_ang = st.number_input("Vビット角度 (度)", 60.0, step=10.0)
-        use_v_limit = st.checkbox("深さ制限を有効にする", value=False)
-        if use_v_limit:
-            v_lim = st.number_input("最大深さ制限 (mm)", value=-3.0, max_value=0.0, step=0.1)
-        else:
-            v_lim = -100.0
+        use_v_limit = st.checkbox("深さ制限", False)
+        if use_v_limit: v_lim = st.number_input("最大深さ (mm)", value=-3.0, max_value=0.0, step=0.1)
+        else: v_lim = -100.0
         feed_v = st.number_input("送り速度 (mm/min)", 300, step=50, key="fv")
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
 
     with tab4:
-        enable_drill = st.checkbox("ドリル加工有効", False)
+        enable_drill = st.checkbox("ドリル有効", False)
         st.divider()
         drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
@@ -432,139 +443,135 @@ if f:
     polys_raw = dxf_to_shapely_list(f.getvalue())
     
     if polys_raw:
-        # パス選択UI
+        # 1. パス選択UI (先に選択させる)
         st.sidebar.divider()
-        st.sidebar.subheader("📐 パス選択 & 原点")
+        st.sidebar.subheader("📐 パス選択 (ゴミ除去)")
         
         selected_indices = []
         container = st.sidebar.container()
-        
-        # 原点再計算オプション
-        recenter = container.checkbox("☑️ 選択した図形で原点を再計算", value=False, help="DXFのゴミデータ等で原点がズレる場合にチェックしてください")
         all_checked = container.checkbox("すべて選択", value=True)
         
         for i, p in enumerate(polys_raw):
-            # 選択前の生座標で面積表示
-            area = p.area
-            is_checked = container.checkbox(f"Path #{i+1} (Area: {area:.1f})", value=all_checked, key=f"p_{i}")
+            # 面積と中心座標を表示してゴミ判別しやすくする
+            cx, cy = p.centroid.x, p.centroid.y
+            label = f"Path #{i+1} (Area:{p.area:.2f}, Pos:{cx:.0f},{cy:.0f})"
+            is_checked = container.checkbox(label, value=all_checked, key=f"p_{i}")
             if is_checked: selected_indices.append(i)
         
-        if not selected_indices:
-            st.warning("パスが選択されていません")
+        target_polys_raw = [polys_raw[i] for i in selected_indices]
+        
+        # 2. 原点計算 (選択されたものだけを基準にする)
+        if target_polys_raw:
+            temp_union = unary_union(target_polys_raw)
+            minx, miny, maxx, maxy = temp_union.bounds
+            w, h = maxx-minx, maxy-miny
         else:
-            # --- 座標変換ロジック ---
-            # 原点計算の対象となるポリゴン群を決定
-            if recenter:
-                # 選択されたポリゴンだけを使って原点(BoundingBox)を計算
-                origin_calc_polys = [polys_raw[i] for i in selected_indices]
-            else:
-                # 全てのポリゴンを使って原点を計算（デフォルト）
-                origin_calc_polys = polys_raw
+            minx, miny, w, h = 0, 0, 0, 0
             
-            # バウンディングボックス取得
-            if origin_calc_polys:
-                temp_union = unary_union(origin_calc_polys)
-                minx, miny, maxx, maxy = temp_union.bounds
-                w, h = maxx-minx, maxy-miny
-            else:
-                minx, miny, w, h = 0, 0, 0, 0
-
-            # オフセット量決定
-            offset_x, offset_y = 0, 0
-            if origin == "Bottom-Left":
-                offset_x, offset_y = -minx, -miny
-            elif origin == "Center":
-                offset_x, offset_y = -(minx+w/2), -(miny+h/2)
+        offset_x, offset_y = 0, 0
+        if origin.startswith("Bottom-Left"):
+            offset_x, offset_y = -minx, -miny
+        elif origin.startswith("Center"):
+            offset_x, offset_y = -(minx+w/2), -(miny+h/2)
             
-            # 全ポリゴンを移動（描画用）
-            polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
+        # 3. 座標変換
+        # 表示用: 全て移動
+        polys_moved_all = [translate(p, offset_x, offset_y) for p in polys_raw]
+        # 計算用: 選択されたものだけ移動して結合
+        target_polys_moved = [polys_moved_all[i] for i in selected_indices]
+        geom_for_calc = merge_polygons_xor(target_polys_moved)
+        
+        # --- ドリル穴解析 (ヒント表示) ---
+        if geom_for_calc:
+            drill_sizes = analyze_holes(geom_for_calc)
+            if drill_sizes:
+                msg = "💡 検出された円(穴): " + ", ".join([f"φ{d}mm({c}個)" for d, c in drill_sizes.items()])
+                st.sidebar.info(msg)
+        
+        # --- プレビュー ---
+        c1, c2 = st.columns(2)
+        with c1:
+            st.success(f"加工サイズ: {w:.1f} x {h:.1f} mm")
+            fig, ax = plt.subplots(figsize=(5,5))
             
-            # 加工対象のポリゴンを抽出
-            target_polys = [polys_moved[i] for i in selected_indices]
-            geom_for_calc = merge_polygons_xor(target_polys)
+            # 原点マーカー
+            ax.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
+            ax.axhline(0, color='red', linewidth=0.5, alpha=0.5)
+            ax.axvline(0, color='red', linewidth=0.5, alpha=0.5)
+
+            for i, p in enumerate(polys_moved_all):
+                style = 'k-' if i in selected_indices else 'k:' # 非選択は点線
+                alpha = 1.0 if i in selected_indices else 0.1   # 非選択は薄く
+                ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
+                for interior in p.interiors: 
+                    ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
             
-            # --- プレビュー ---
-            c1, c2 = st.columns(2)
-            with c1:
-                st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
-                fig, ax = plt.subplots(figsize=(5,5))
-                
-                for i, p in enumerate(polys_moved):
-                    style = 'k-' if i in selected_indices else 'k:'
-                    alpha = 1.0 if i in selected_indices else 0.2
-                    ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
-                    for interior in p.interiors: 
-                        ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
-                
-                if enable_drill and geom_for_calc:
-                     drill_preview = find_drill_points(geom_for_calc, drill_dia_target)
-                     for pt in drill_preview: ax.plot(pt.x, pt.y, 'x', color='tab:purple')
+            if enable_drill and geom_for_calc:
+                 drill_preview = find_drill_points(geom_for_calc, drill_dia_target)
+                 for pt in drill_preview: ax.plot(pt.x, pt.y, 'x', color='tab:purple')
 
-                ax.axis('equal')
-                ax.grid(True, linestyle=':', alpha=0.5)
-                # 軸メモリを表示して座標確認できるようにする
-                st.pyplot(fig)
+            ax.axis('equal')
+            ax.grid(True, linestyle=':', alpha=0.5)
+            st.pyplot(fig)
             
-            with c2:
-                st.header("2. パス生成")
-                
-                p_paths, c_paths, v_paths, drill_pts = [], [], [], []
-                gc_p, gc_c, gc_v, gc_d = None, None, None, None
+        with c2:
+            st.header("2. パス生成")
+            
+            p_paths, c_paths, v_paths, drill_pts = [], [], [], []
+            gc_p, gc_c, gc_v, gc_d = None, None, None, None
 
-                if geom_for_calc and not geom_for_calc.is_empty:
-                    if enable_pocket:
-                        p_paths = generate_pocket(geom_for_calc, dia, clear, step, use_dogbone)
-                        gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
-                    
-                    if enable_chamfer:
-                        c_paths = generate_chamfer(geom_for_calc, chamfer_w, tip_off)
-                        gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
-                    
-                    if enable_vcarve:
-                        if tab3: 
-                            with st.spinner("Vカービングパス計算中..."):
-                                v_paths = generate_vcarve(geom_for_calc, v_ang, use_v_limit, v_lim, v_res)
-                        gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
-                    
-                    if enable_drill:
-                        drill_pts = find_drill_points(geom_for_calc, drill_dia_target)
-                        gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
+            if geom_for_calc and not geom_for_calc.is_empty:
+                if enable_pocket:
+                    p_paths = generate_pocket(geom_for_calc, dia, clear, step, use_dogbone)
+                    gc_p = make_gcode(p_paths, 0, depth, feed_p, "EndMill", h_code, f_code, pp["format"]) if p_paths else None
+                
+                if enable_chamfer:
+                    c_paths = generate_chamfer(geom_for_calc, chamfer_w, tip_off)
+                    gc_c = make_gcode(c_paths, 0, z_c, feed_c, "Chamfer", h_code, f_code, pp["format"]) if c_paths else None
+                
+                if enable_vcarve:
+                    if tab3: 
+                        with st.spinner("Vカービングパス計算中..."):
+                            v_paths = generate_vcarve(geom_for_calc, v_ang, use_v_limit, v_lim, v_res)
+                    gc_v = make_gcode(v_paths, 0, 0, feed_v, "VBit", h_code, f_code, pp["format"], True) if v_paths else None
+                
+                if enable_drill:
+                    drill_pts = find_drill_points(geom_for_calc, drill_dia_target)
+                    gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
-                # 結果プレビュー
-                fig2, ax2 = plt.subplots(figsize=(5,5))
-                for p in polys_moved:
-                    ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
-                    for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
-                
-                if enable_pocket: ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
-                if enable_chamfer: ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
-                if enable_vcarve: ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
-                if enable_drill: ax2.plot([], [], color='tab:purple', marker='x', linestyle='None', label='Drill')
+            fig2, ax2 = plt.subplots(figsize=(5,5))
+            for p in target_polys_moved: # 選択されたものだけ描画
+                ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
+                for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
+            
+            if enable_pocket: ax2.plot([], [], color='tab:blue', linewidth=1.5, label='Pocket')
+            if enable_chamfer: ax2.plot([], [], color='tab:green', linewidth=1.5, label='Chamfer')
+            if enable_vcarve: ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
+            if enable_drill: ax2.plot([], [], color='tab:purple', marker='x', linestyle='None', label='Drill')
 
-                if p_paths:
-                    for ls in p_paths: ax2.plot(*ls.xy, color='tab:blue', alpha=0.9, linewidth=1.0)
-                if c_paths:
-                    for ls in c_paths: ax2.plot(*ls.xy, color='tab:green', alpha=0.9, linewidth=1.0)
-                if v_paths:
-                    for pts in v_paths:
-                        ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='tab:red', linewidth=0.8)
-                if drill_pts:
-                    for pt in drill_pts:
-                        ax2.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8, markeredgewidth=2)
-                
-                ax2.legend(loc='upper right', framealpha=0.9)
-                ax2.axis('equal')
-                st.pyplot(fig2)
-                
-                # ダウンロード
-                b1, b2, b3, b4 = st.columns(4)
-                if gc_p: b1.download_button("📥 POCKET", gc_p, f"{base_name}_pocket.nc")
-                if gc_c: b2.download_button("📥 CHAMFER", gc_c, f"{base_name}_chamfer.nc")
-                if gc_v: b3.download_button("📥 VCARVE", gc_v, f"{base_name}_vcarve.nc")
-                if gc_d: b4.download_button("📥 DRILL", gc_d, f"{base_name}_drill.nc")
-                
-                if drill_pts:
-                    st.success(f"ドリル穴: {len(drill_pts)}箇所")
+            if p_paths:
+                for ls in p_paths: ax2.plot(*ls.xy, color='tab:blue', alpha=0.9, linewidth=1.0)
+            if c_paths:
+                for ls in c_paths: ax2.plot(*ls.xy, color='tab:green', alpha=0.9, linewidth=1.0)
+            if v_paths:
+                for pts in v_paths:
+                    ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='tab:red', linewidth=0.8)
+            if drill_pts:
+                for pt in drill_pts:
+                    ax2.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8, markeredgewidth=2)
+            
+            ax2.legend(loc='upper right', framealpha=0.9)
+            ax2.axis('equal')
+            st.pyplot(fig2)
+            
+            b1, b2, b3, b4 = st.columns(4)
+            if gc_p: b1.download_button("📥 POCKET", gc_p, f"{base_name}_pocket.nc")
+            if gc_c: b2.download_button("📥 CHAMFER", gc_c, f"{base_name}_chamfer.nc")
+            if gc_v: b3.download_button("📥 VCARVE", gc_v, f"{base_name}_vcarve.nc")
+            if gc_d: b4.download_button("📥 DRILL", gc_d, f"{base_name}_drill.nc")
+            
+            if drill_pts:
+                st.success(f"ドリル穴: {len(drill_pts)}箇所")
             
     else:
         st.error("有効な閉じた図形が見つかりません。")
