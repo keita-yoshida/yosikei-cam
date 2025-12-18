@@ -379,11 +379,10 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.6: 原点自動補正・全図形基準版")
+st.caption("Ver 4.7: 送り速度制限撤廃・原点自動補正・ドリル解析")
 
 with st.sidebar:
     st.header("📍 原点設定")
-    # デフォルトを左下基準(自動補正)に設定
     origin = st.radio("原点基準", ["Bottom-Left (全図形の左下)", "Center (全図形の中心)", "Original (CAD座標)"], index=0, help="Bottom-Left: 全ての図形を含む範囲の左下を(0,0)に自動補正します。")
     
     st.divider()
@@ -398,14 +397,16 @@ with st.sidebar:
         depth = st.number_input("深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
         step = st.slider("ステップオーバー (%)", 10, 90, 50) / 100.0
         use_dogbone = st.checkbox("ドッグボーン (角逃げ)", True)
-        feed_p = st.number_input("送り速度 (mm/min)", 300, step=50, key="fp")
+        # 修正: min_value=1.0, max_value=None
+        feed_p = st.number_input("送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fp")
         
     with tab2:
         enable_chamfer = st.checkbox("面取り有効", True)
         st.divider()
         chamfer_w = st.number_input("面取り幅 (mm)", 0.5, step=0.1)
         tip_off = st.number_input("刃先オフセット (mm)", value=1.0, min_value=0.0, max_value=None, step=0.1, format="%.3f")
-        feed_c = st.number_input("送り速度 (mm/min)", 300, step=50, key="fc")
+        # 修正: min_value=1.0, max_value=None
+        feed_c = st.number_input("送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fc")
         z_c = -(chamfer_w + tip_off)
         st.caption(f"切込深さ: {z_c:.2f}mm")
         
@@ -416,7 +417,8 @@ with st.sidebar:
         use_v_limit = st.checkbox("深さ制限", False)
         if use_v_limit: v_lim = st.number_input("最大深さ (mm)", value=-3.0, max_value=0.0, step=0.1)
         else: v_lim = -100.0
-        feed_v = st.number_input("送り速度 (mm/min)", 300, step=50, key="fv")
+        # 修正: min_value=1.0, max_value=None
+        feed_v = st.number_input("送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fv")
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
 
     with tab4:
@@ -425,7 +427,8 @@ with st.sidebar:
         drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
         peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5)
-        feed_d = st.number_input("送り速度 (mm/min)", 200, step=50, key="fd")
+        # 修正: min_value=1.0, max_value=None
+        feed_d = st.number_input("送り速度 (mm/min)", value=200, min_value=1, max_value=None, step=50, key="fd")
 
     st.divider()
     pp_name = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys()))
@@ -442,20 +445,19 @@ if f:
     polys_raw = dxf_to_shapely_list(f.getvalue())
     
     if polys_raw:
-        # ★★★ 原点自動補正ロジック ★★★
-        # 1. 全図形の結合範囲を取得
+        # 1. 全図形の結合範囲
         temp_union = unary_union(polys_raw)
         minx, miny, maxx, maxy = temp_union.bounds
         w, h = maxx-minx, maxy-miny
         
-        # 2. 補正量計算 (全図形基準)
+        # 2. 補正量計算
         offset_x, offset_y = 0, 0
         if origin.startswith("Bottom-Left"):
             offset_x, offset_y = -minx, -miny
         elif origin.startswith("Center"):
             offset_x, offset_y = -(minx+w/2), -(miny+h/2)
             
-        # 3. 全データを補正 (これがデフォルト状態になる)
+        # 3. 補正
         polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
         
         # 4. パス選択UI
@@ -472,24 +474,20 @@ if f:
             is_checked = container.checkbox(label, value=all_checked, key=f"p_{i}")
             if is_checked: selected_indices.append(i)
         
-        # 加工対象の抽出
         target_polys = [polys_moved[i] for i in selected_indices]
         geom_for_calc = merge_polygons_xor(target_polys)
         
-        # --- ドリル穴解析 (ヒント) ---
         if geom_for_calc:
             drill_sizes = analyze_holes(geom_for_calc)
             if drill_sizes:
                 msg = "💡 検出された円(穴): " + ", ".join([f"φ{d}mm({c}個)" for d, c in drill_sizes.items()])
                 st.sidebar.info(msg)
         
-        # --- プレビュー ---
         c1, c2 = st.columns(2)
         with c1:
             st.success(f"加工サイズ: {w:.1f} x {h:.1f} mm")
             fig, ax = plt.subplots(figsize=(5,5))
             
-            # 原点マーカー (0,0) を明示
             ax.plot(0, 0, 'r+', markersize=20, markeredgewidth=2, zorder=10, label="原点 (0,0)")
             ax.axhline(0, color='red', linewidth=0.5, alpha=0.5)
             ax.axvline(0, color='red', linewidth=0.5, alpha=0.5)
@@ -536,7 +534,6 @@ if f:
                     gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
-            # 原点マーカー (結果側にも)
             ax2.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
             ax2.axhline(0, color='red', linewidth=0.5, alpha=0.5)
             ax2.axvline(0, color='red', linewidth=0.5, alpha=0.5)
