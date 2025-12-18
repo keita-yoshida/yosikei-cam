@@ -91,52 +91,56 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     poly = polygon.simplify(0.001)
     if poly.geom_type != 'Polygon': return polygon
     
-    coords = list(poly.exterior.coords)
-    if coords[0] == coords[-1]: coords.pop()
-    
-    num_pts = len(coords)
+    # 外周と穴（Interiors）の両方を処理
+    rings = [poly.exterior] + list(poly.interiors)
     dogbone_circles = []
     r = tool_dia / 2.0
     overcut_ratio = 1.05 
     
-    for i in range(num_pts):
-        p_curr = np.array(coords[i])
-        p_prev = np.array(coords[(i - 1) % num_pts])
-        p_next = np.array(coords[(i + 1) % num_pts])
+    for ring in rings:
+        coords = list(ring.coords)
+        if coords[0] == coords[-1]: coords.pop()
+        num_pts = len(coords)
         
-        v1 = p_curr - p_prev
-        v2 = p_next - p_curr
-        
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6: continue
-        v1 /= n1
-        v2 /= n2
-        
-        cross = np.cross(v1, v2)
-        dot = np.dot(v1, v2)
-        angle_deg = math.degrees(math.atan2(cross, dot))
-        
-        if 5 < abs(angle_deg) < 175:
-            bisector = v2 - v1
-            bn = np.linalg.norm(bisector)
-            if bn > 1e-6:
-                bisector /= bn
-                test_pt = p_curr + bisector * 0.01
-                # ポリゴン内部（削る側）に向ける
-                if not poly.contains(Point(test_pt)):
-                    bisector = -bisector
-                
-                # 鋭角対策の配置位置計算
-                half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
-                if half_angle_rad < 0.1: half_angle_rad = 0.1
-                
-                dist_theoretical = r / math.sin(half_angle_rad)
-                offset = (dist_theoretical - r) + (r * 0.05)
-                
-                center = p_curr + bisector * offset
-                circle = Point(center).buffer(r, resolution=16)
-                dogbone_circles.append(circle)
+        for i in range(num_pts):
+            p_curr = np.array(coords[i])
+            p_prev = np.array(coords[(i - 1) % num_pts])
+            p_next = np.array(coords[(i + 1) % num_pts])
+            
+            v1 = p_curr - p_prev
+            v2 = p_next - p_curr
+            
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6: continue
+            v1 /= n1
+            v2 /= n2
+            
+            cross = np.cross(v1, v2)
+            dot = np.dot(v1, v2)
+            angle_deg = math.degrees(math.atan2(cross, dot))
+            
+            if 5 < abs(angle_deg) < 175:
+                bisector = v2 - v1
+                bn = np.linalg.norm(bisector)
+                if bn > 1e-6:
+                    bisector /= bn
+                    test_pt = p_curr + bisector * 0.01
+                    
+                    # 常に「削る領域（ポリゴン内部）」に向ける
+                    is_inside = poly.contains(Point(test_pt))
+                    if not is_inside:
+                        bisector = -bisector
+                    
+                    half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
+                    if half_angle_rad < 0.1: half_angle_rad = 0.1
+                    
+                    dist_theoretical = r / math.sin(half_angle_rad)
+                    offset = (dist_theoretical - r) + (r * 0.05)
+                    center = p_curr + bisector * offset
+                    
+                    circle = Point(center).buffer(r, resolution=16)
+                    dogbone_circles.append(circle)
 
     if not dogbone_circles: return polygon
     try:
@@ -182,7 +186,6 @@ def dxf_to_shapely_list(dxf_bytes):
                                 if clean.geom_type == 'Polygon': polys.append(clean)
                                 elif clean.geom_type == 'MultiPolygon': polys.extend(clean.geoms)
                 except: pass
-        
         polys.sort(key=lambda x: x.area, reverse=True)
         return polys
     except Exception as e:
@@ -199,7 +202,7 @@ def merge_polygons_xor(polys):
         else: combined = combined.symmetric_difference(p)
     return combined
 
-# --- 3. ドリル穴検出 ---
+# --- 3. ドリル ---
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
     polys = ensure_list_of_polys(geometry)
@@ -231,7 +234,7 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     safe = 5.0
     for pt in points:
         x, y = pt.x, pt.y
-        gc.append(f"; Drill Hole at X{x:.2f} Y{y:.2f}")
+        gc.append(f"; Drill Hole at X{x:.3f} Y{y:.3f}")
         gc.append(f"{G0} X{x:.3f} Y{y:.3f}")
         gc.append(f"{G0} Z{z_start + 1.0}")
         current_z = z_start
@@ -247,19 +250,17 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     gc.append(footer.strip())
     return "\n".join(gc)
 
-# --- 4. パス生成ロジック (荒取り/仕上げ分離) ---
+# --- 4. パス生成 (荒/仕上げ分離) ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     paths = []
     r = tool_d / 2.0
     step = tool_d * stepover
     
-    # 1. 荒取り
+    # 荒取り (ドッグボーンなし)
     offset_rough = -(r - clearance + step)
-    try:
-        current_rough = geometry.buffer(offset_rough, join_style=2)
-    except:
-        current_rough = Polygon()
+    try: current_rough = geometry.buffer(offset_rough, join_style=2)
+    except: current_rough = Polygon()
 
     while not current_rough.is_empty and current_rough.area > 0.01:
         current_polys = ensure_list_of_polys(current_rough)
@@ -270,11 +271,9 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
 
-    # 2. 仕上げ（ドッグボーンあり）
+    # 仕上げ (ドッグボーンあり)
     work_geom_finish = geometry
-    if dogbone:
-        work_geom_finish = apply_dogbone(geometry, tool_d)
-    
+    if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
     offset_finish = -(r - clearance)
     try:
         finish_pass = work_geom_finish.buffer(offset_finish, join_style=2)
@@ -283,7 +282,6 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
             paths.insert(0, p.exterior)
             paths.extend(p.interiors)
     except: pass
-
     return [LineString(p.coords) for p in paths if p.length > 0.1]
 
 def generate_chamfer(geometry, width, tip_offset):
@@ -381,13 +379,14 @@ def make_gcode(paths, z_start, z_final, feed, tool_name, header, footer, fmt="G0
 
 st.set_page_config(page_title="Multi-Path CAM", layout="wide")
 st.title("⚡ Multi-Path CAM")
-st.caption("Ver 4.2: 刃先オフセット制限撤廃・ファイル名自動設定")
+st.caption("Ver 4.4: 原点可視化・オートスケール対策版")
 
 with st.sidebar:
     st.header("📍 原点設定")
-    origin = st.radio("加工原点 (0,0)", ["Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"], index=0)
-    st.divider()
+    # 初期値をBottom-Left (index=0) に固定して安全化
+    origin = st.radio("加工原点 (0,0)", ["Bottom-Left (左下)", "Center (中心)", "Original (DXF座標)"], index=0, help="Bottom-Left: 図形の左下が(0,0)になります。\nOriginal: CADで描いた座標をそのまま使います。")
     
+    st.divider()
     st.header("⚙️ 加工設定")
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
@@ -405,7 +404,6 @@ with st.sidebar:
         enable_chamfer = st.checkbox("面取り加工有効", True)
         st.divider()
         chamfer_w = st.number_input("面取り幅 (mm)", 0.5, step=0.1)
-        # 刃先オフセットの上限を撤廃 (max_value=None)
         tip_off = st.number_input("刃先オフセット (mm)", value=1.0, min_value=0.0, max_value=None, step=0.1, format="%.3f")
         feed_c = st.number_input("送り速度 (mm/min)", 300, step=50, key="fc")
         z_c = -(chamfer_w + tip_off)
@@ -442,24 +440,26 @@ st.header("1. DXFアップロード")
 f = st.file_uploader("", type=["dxf"])
 
 if f:
-    # ファイル名から拡張子を除いたベース名を取得
     base_name = os.path.splitext(f.name)[0]
-    
     polys_raw = dxf_to_shapely_list(f.getvalue())
     
     if polys_raw:
+        # 1. バウンディングボックス計算 (全データ)
         temp_union = unary_union(polys_raw)
         minx, miny, maxx, maxy = temp_union.bounds
         w, h = maxx-minx, maxy-miny
         
+        # 2. 原点シフト量決定
         offset_x, offset_y = 0, 0
         if origin == "Bottom-Left":
             offset_x, offset_y = -minx, -miny
         elif origin == "Center":
             offset_x, offset_y = -(minx+w/2), -(miny+h/2)
             
+        # 3. 座標変換 (全ポリゴン)
         polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
         
+        # 4. パス選択UI
         st.sidebar.divider()
         st.sidebar.subheader("📐 パス選択")
         
@@ -474,11 +474,23 @@ if f:
         target_polys = [polys_moved[i] for i in selected_indices]
         geom_for_calc = merge_polygons_xor(target_polys)
         
+        # --- プレビュー (原点可視化) ---
         c1, c2 = st.columns(2)
         with c1:
             st.success(f"読み込み成功: {w:.1f} x {h:.1f} mm")
+            
+            # Gコードの範囲情報を表示
+            final_bounds = geom_for_calc.bounds if geom_for_calc else (0,0,0,0)
+            if geom_for_calc:
+                st.info(f"加工範囲: X {final_bounds[0]:.1f}〜{final_bounds[2]:.1f}, Y {final_bounds[1]:.1f}〜{final_bounds[3]:.1f}")
+
             fig, ax = plt.subplots(figsize=(5,5))
             
+            # 原点マーカー (0,0)
+            ax.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, label='Machine Origin (0,0)', zorder=10)
+            ax.axhline(0, color='red', linewidth=0.5, alpha=0.5)
+            ax.axvline(0, color='red', linewidth=0.5, alpha=0.5)
+
             for i, p in enumerate(polys_moved):
                 style = 'k-' if i in selected_indices else 'k:'
                 alpha = 1.0 if i in selected_indices else 0.2
@@ -492,6 +504,7 @@ if f:
 
             ax.axis('equal')
             ax.grid(True, linestyle=':', alpha=0.5)
+            ax.legend(loc='lower right')
             st.pyplot(fig)
             
         with c2:
@@ -520,6 +533,12 @@ if f:
                     gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
+            
+            # 原点マーカー (右側にも表示)
+            ax2.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
+            ax2.axhline(0, color='red', linewidth=0.5, alpha=0.5)
+            ax2.axvline(0, color='red', linewidth=0.5, alpha=0.5)
+
             for p in polys_moved:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
                 for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
@@ -544,7 +563,6 @@ if f:
             ax2.axis('equal')
             st.pyplot(fig2)
             
-            # ダウンロードボタン (ファイル名自動生成)
             b1, b2, b3, b4 = st.columns(4)
             if gc_p: b1.download_button("📥 POCKET", gc_p, f"{base_name}_pocket.nc")
             if gc_c: b2.download_button("📥 CHAMFER", gc_c, f"{base_name}_chamfer.nc")
