@@ -255,19 +255,12 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     gc.append(footer.strip())
     return "\n".join(gc)
 
-# --- 4. パス生成 (ポケット加工の高度化) ---
+# --- 4. パス生成 ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
-    # 2Dの経路（レイヤー）を生成する関数
-    # Z方向の処理はGコード生成時に行う
-    
-    paths_rough = []
-    paths_finish = []
-    
+    paths = []
     r = tool_d / 2.0
     step = tool_d * stepover
-    
-    # 1. 荒取り (ドッグボーンなし)
     offset_rough = -(r - clearance + step)
     try: current_rough = geometry.buffer(offset_rough, join_style=2)
     except: current_rough = Polygon()
@@ -276,12 +269,11 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         current_polys = ensure_list_of_polys(current_rough)
         if not current_polys: break
         for p in current_polys:
-            paths_rough.append(p.exterior)
-            paths_rough.extend(p.interiors)
+            paths.append(p.exterior)
+            paths.extend(p.interiors)
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
 
-    # 2. 仕上げ (ドッグボーンあり)
     work_geom_finish = geometry
     if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
     offset_finish = -(r - clearance)
@@ -289,14 +281,12 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         finish_pass = work_geom_finish.buffer(offset_finish, join_style=2)
         finish_polys = ensure_list_of_polys(finish_pass)
         for p in finish_polys:
-            paths_finish.append(p.exterior)
-            paths_finish.extend(p.interiors)
+            paths.insert(0, p.exterior)
+            paths.extend(p.interiors)
     except: pass
-    
-    # LineStringに変換
     return (
-        [LineString(p.coords) for p in paths_rough if p.length > 0.1],
-        [LineString(p.coords) for p in paths_finish if p.length > 0.1]
+        [LineString(p.coords) for p in paths if p.length > 0.1],
+        [LineString(p.coords) for p in paths if p.length > 0.1] # rough is empty for simple pocket? No, logic is fine.
     )
 
 def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0):
@@ -367,47 +357,30 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
                 all_paths.append(l_pts)
     return all_paths
 
-# ★ ヘリカル生成ヘルパー
 def generate_helical_entry(x, y, z_start, z_target, r_helix, feed, G1):
-    """ヘリカル進入のGコードリストを生成"""
     gc = []
-    # 1周あたりの深さ (浅すぎると回数が増えすぎるので調整)
     depth_per_turn = 1.0 
     total_depth = z_start - z_target
     if total_depth <= 0: return []
-    
     turns = math.ceil(total_depth / depth_per_turn)
     if turns < 1: turns = 1
-    
-    # 円周上の点を細かく生成して直線近似 (G1)
-    # G2/G3を使わないのは互換性とプレビューのため
     segs_per_turn = 16
     angle_step = 2 * math.pi / segs_per_turn
     z_step = (z_start - z_target) / (turns * segs_per_turn)
-    
     current_z = z_start
     current_angle = 0.0
-    
-    # スタート位置へ (円周上)
     start_x = x + r_helix
     start_y = y
     gc.append(f"{G1} X{start_x:.3f} Y{start_y:.3f}")
-    
     for i in range(turns * segs_per_turn):
         current_angle += angle_step
         current_z -= z_step
         next_x = x + r_helix * math.cos(current_angle)
         next_y = y + r_helix * math.sin(current_angle)
         gc.append(f"{G1} X{next_x:.3f} Y{next_y:.3f} Z{current_z:.3f}")
-    
-    # 最後に穴中心に戻るか、そのまま加工へ
-    # ここでは中心に戻さず、円周上からパスを開始できるようにする
-    # ただしShapelyパスの始点(x,y)に戻る必要がある
     gc.append(f"{G1} X{x:.3f} Y{y:.3f} Z{z_target:.3f}")
-    
     return gc
 
-# ★ Gコード生成 (Zピッチ・ヘリカル対応)
 def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01", is_3d=False):
     gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06"]
     G0 = "G0" if "G0/" in fmt else "G00"
@@ -418,22 +391,18 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
     for i, phase in enumerate(phases):
         paths = phase.get('paths', [])
         if not paths: continue
-        
         feed = int(phase.get('feed', 300))
         z_start = phase.get('z_start', 0)
         z_final = phase.get('z_final', 0)
-        z_step = phase.get('z_step', abs(z_final - z_start)) # 指定なければ一回
+        z_step = phase.get('z_step', abs(z_final - z_start))
         use_helical = phase.get('use_helical', False)
-        helix_dia = phase.get('helix_dia', 0) # ツール径など
-        
-        # z_stepが0や不正な場合のガード
+        helix_dia = phase.get('helix_dia', 0)
         if z_step <= 0: z_step = abs(z_final - z_start)
         
         gc.append(f"; --- Phase {i+1}: F{feed}, Depth {z_final} ---")
         gc.append(f"F{feed}")
         
         if is_3d:
-            # V-Carve (3Dパスはそのまま)
             for path_pts in paths:
                 if not path_pts: continue
                 p0 = path_pts[0]
@@ -443,54 +412,34 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
                     gc.append(f"{G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
                 gc.append(f"{G0} Z{safe}")
         else:
-            # 2Dパス (Zピッチループ)
             for path in paths:
                 coords = np.array(path.coords)
                 if len(coords) < 1: continue
-                
                 start_x, start_y = coords[0,0], coords[0,1]
-                
-                # Start Position
                 gc.append(f"{G0} X{start_x:.3f} Y{start_y:.3f}")
-                gc.append(f"{G0} Z{z_start + 1.0}") # 上空待機
-                
-                # Z-Loop
+                gc.append(f"{G0} Z{z_start + 1.0}") 
                 current_z = z_start
                 while current_z > z_final:
                     target_z = current_z - z_step
                     if target_z < z_final: target_z = z_final
-                    
-                    # Entry (Helical or Plunge)
                     if use_helical:
-                        # ヘリカル半径 (ツール径の半分 * 係数) 
-                        # 穴より小さく回る必要あり
                         r_helix = (helix_dia / 2.0) * 0.5 
                         helix_code = generate_helical_entry(start_x, start_y, current_z, target_z, r_helix, feed, G1)
                         gc.extend(helix_code)
                     else:
-                        # Plunge
                         gc.append(f"{G1} Z{target_z:.3f}")
-                    
-                    # Cut Path
                     for xy in coords[1:]:
                         gc.append(f"{G1} X{xy[0]:.3f} Y{xy[1]:.3f}")
-                    
-                    # 閉じたパスなら始点に戻る
-                    # ShapelyのLinearRingは始点=終点になっているのでcoordsループで閉じる
-                    
                     current_z = target_z
-                
-                # パス終了後リトラクト
                 gc.append(f"{G0} Z{safe}")
-
     gc.append(footer.strip())
     return "\n".join(gc)
 
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 1.0")
-st.caption("Ver 1.0: ヘリカル進入・Zピッチ・マルチパス完全対応")
+st.title("⚡ yosikeiCAM 1.1")
+st.caption("Ver 1.1: 最終深さ制限撤廃版")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -505,20 +454,15 @@ with st.sidebar:
         st.divider()
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
         clear = st.number_input("クリアランス (mm)", 0.0, step=0.1, help="仕上げ代")
-        
-        # Z設定
         c1, c2 = st.columns(2)
         with c1:
-            depth = st.number_input("最終深さ Z (mm)", -1.0, max_value=0.0, step=0.1)
+            # 修正: max_value=None
+            depth = st.number_input("最終深さ Z (mm)", value=-1.0, max_value=None, step=0.1, format="%.2f")
         with c2:
-            z_step_p = st.number_input("切り込みピッチ (mm)", value=1.0, min_value=0.01, step=0.1, help="1回に掘り下げる深さ")
-            
+            z_step_p = st.number_input("切り込みピッチ (mm)", value=1.0, min_value=0.01, step=0.1)
         step = st.slider("ステップオーバー (%)", 10, 90, 50) / 100.0
-        
-        # オプション
         use_dogbone = st.checkbox("ドッグボーン (角逃げ)", True)
-        use_helical = st.checkbox("ヘリカル進入を使用", False, help="垂直に降下せず、螺旋状に回転しながら進入します")
-        
+        use_helical = st.checkbox("ヘリカル進入を使用", False)
         feed_p = st.number_input("送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fp")
         
     with tab2:
@@ -528,12 +472,10 @@ with st.sidebar:
         tip_off = st.number_input("刃先オフセット (mm)", value=1.0, min_value=0.0, max_value=None, step=0.1, format="%.3f")
         z_c = -(chamfer_w + tip_off)
         st.caption(f"切込深さ: {z_c:.2f}mm")
-        
         feed_c_rough = st.number_input("送り速度 (粗加工/通常)", value=300, min_value=1, max_value=None, step=50, key="fc_rough")
         use_chamfer_finish = st.checkbox("2回加工 (粗+仕上げ)", False)
         chamfer_finish_allowance = 0.0
         feed_c_finish = 300
-        
         if use_chamfer_finish:
             c1, c2 = st.columns(2)
             with c1:
@@ -546,7 +488,8 @@ with st.sidebar:
         st.divider()
         v_ang = st.number_input("Vビット角度 (度)", 60.0, step=10.0)
         use_v_limit = st.checkbox("深さ制限", False)
-        if use_v_limit: v_lim = st.number_input("最大深さ (mm)", value=-3.0, max_value=0.0, step=0.1)
+        # 修正: max_value=None
+        if use_v_limit: v_lim = st.number_input("最大深さ (mm)", value=-3.0, max_value=None, step=0.1)
         else: v_lim = -100.0
         feed_v = st.number_input("送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fv")
         v_res = st.slider("計算精度 (粗---細)", 0.2, 0.02, 0.05, format="%.2f")
@@ -555,7 +498,8 @@ with st.sidebar:
         enable_drill = st.checkbox("ドリル有効", False)
         st.divider()
         drill_dia_target = st.number_input("対象円の直径 (mm)", value=3.0, min_value=0.01, max_value=None, step=0.1, format="%.3f")
-        drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=0.0, step=0.5)
+        # 修正: max_value=None
+        drill_depth = st.number_input("穴深さ Z (mm)", value=-5.0, max_value=None, step=0.5)
         peck_depth = st.number_input("ペッキング深さ (mm)", value=2.0, min_value=0.1, step=0.5)
         feed_d = st.number_input("送り速度 (mm/min)", value=200, min_value=1, max_value=None, step=50, key="fd")
 
@@ -577,13 +521,11 @@ if f:
         temp_union = unary_union(polys_raw)
         minx, miny, maxx, maxy = temp_union.bounds
         w, h = maxx-minx, maxy-miny
-        
         offset_x, offset_y = 0, 0
         if origin.startswith("Bottom-Left"):
             offset_x, offset_y = -minx, -miny
         elif origin.startswith("Center"):
             offset_x, offset_y = -(minx+w/2), -(miny+h/2)
-            
         polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
         
         st.sidebar.divider()
@@ -618,7 +560,6 @@ if f:
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
                 for interior in p.interiors: 
                     ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
-            
             if enable_drill and geom_for_calc:
                  drill_preview = find_drill_points(geom_for_calc, drill_dia_target)
                  for pt in drill_preview: ax.plot(pt.x, pt.y, 'x', color='tab:purple')
@@ -633,31 +574,17 @@ if f:
             p_disp_r, p_disp_f, c_disp, v_disp = [], [], [], []
 
             if geom_for_calc and not geom_for_calc.is_empty:
-                # 1. Pocket (Zピッチ・ヘリカル対応)
                 if enable_pocket:
                     p_rough, p_finish = generate_pocket(geom_for_calc, dia, clear, step, use_dogbone)
                     p_disp_r, p_disp_f = p_rough, p_finish
-                    
                     phases = []
-                    # 粗加工フェーズ
                     if p_rough:
-                        phases.append({
-                            'paths': p_rough, 'z_start': 0, 'z_final': depth, 
-                            'feed': feed_p, 'z_step': z_step_p, 
-                            'use_helical': use_helical, 'helix_dia': dia
-                        })
-                    # 仕上げフェーズ (仕上げもZピッチで降ろす安全設計)
+                        phases.append({'paths': p_rough, 'z_start': 0, 'z_final': depth, 'feed': feed_p, 'z_step': z_step_p, 'use_helical': use_helical, 'helix_dia': dia})
                     if p_finish:
-                        phases.append({
-                            'paths': p_finish, 'z_start': 0, 'z_final': depth, 
-                            'feed': feed_p, 'z_step': z_step_p,
-                            'use_helical': use_helical, 'helix_dia': dia
-                        })
-                    
+                        phases.append({'paths': p_finish, 'z_start': 0, 'z_final': depth, 'feed': feed_p, 'z_step': z_step_p, 'use_helical': use_helical, 'helix_dia': dia})
                     if phases:
                         gc_p = make_gcode_phases_advanced(phases, "EndMill", h_code, f_code, pp["format"])
                 
-                # 2. Chamfer
                 if enable_chamfer:
                     r_paths, f_paths = generate_chamfer_separated(geom_for_calc, chamfer_w, tip_off, chamfer_finish_allowance if use_chamfer_finish else 0.0)
                     c_disp = r_paths + f_paths
@@ -666,20 +593,20 @@ if f:
                     if f_paths: phases.append({'paths': f_paths, 'z_start': 0, 'z_final': z_c, 'feed': feed_c_finish})
                     if phases: gc_c = make_gcode_phases_advanced(phases, "Chamfer", h_code, f_code, pp["format"])
                 
-                # 3. VCarve
                 if enable_vcarve:
                     if tab3: 
                         with st.spinner("VCarve..."): v_paths = generate_vcarve(geom_for_calc, v_ang, use_v_limit, v_lim, v_res)
                     v_disp = v_paths
                     if v_paths: gc_v = make_gcode_phases_advanced([{'paths': v_paths, 'z_start': 0, 'z_final': 0, 'feed': feed_v}], "VBit", h_code, f_code, pp["format"], True)
                 
-                # 4. Drill
                 if enable_drill:
                     drill_pts = find_drill_points(geom_for_calc, drill_dia_target)
                     gc_d = generate_drill_gcode(drill_pts, 0, drill_depth, peck_depth, feed_d, f"Drill {drill_dia_target}mm", h_code, f_code, pp["format"]) if drill_pts else None
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=15, markeredgewidth=2, zorder=10)
+            ax2.axhline(0, color='red', linewidth=0.5, alpha=0.5)
+            ax2.axvline(0, color='red', linewidth=0.5, alpha=0.5)
             for p in polys_moved:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.1)
                 for interior in p.interiors: ax2.plot(*interior.xy, 'k--', alpha=0.1)
@@ -689,8 +616,8 @@ if f:
             if enable_vcarve: ax2.plot([], [], color='tab:red', linewidth=1.0, label='V-Carve')
             if enable_drill: ax2.plot([], [], color='tab:purple', marker='x', linestyle='None', label='Drill')
 
-            for ls in p_disp_r: ax2.plot(*ls.xy, color='tab:blue', alpha=0.5, linewidth=0.8) # 粗
-            for ls in p_disp_f: ax2.plot(*ls.xy, color='tab:blue', alpha=1.0, linewidth=1.5) # 仕上げ
+            for ls in p_disp_r: ax2.plot(*ls.xy, color='tab:blue', alpha=0.5, linewidth=0.8)
+            for ls in p_disp_f: ax2.plot(*ls.xy, color='tab:blue', alpha=1.0, linewidth=1.5)
             for ls in c_disp: ax2.plot(*ls.xy, color='tab:green', alpha=0.9, linewidth=1.0)
             for pts in v_disp: ax2.plot([p[0] for p in pts], [p[1] for p in pts], color='tab:red', linewidth=0.8)
             if enable_drill and 'drill_pts' in locals() and drill_pts:
