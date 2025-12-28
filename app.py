@@ -260,11 +260,10 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
     paths_rough = []
     paths_finish = []
-    
     r = tool_d / 2.0
     step = tool_d * stepover
     
-    # 荒取り (ドッグボーンなし)
+    # 荒取り
     offset_rough = -(r + clearance)
     try: current_rough = geometry.buffer(offset_rough, join_style=2)
     except: current_rough = Polygon()
@@ -278,7 +277,7 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
 
-    # 仕上げ (ドッグボーンあり)
+    # 仕上げ
     if clearance > 0:
         work_geom_finish = geometry
         if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
@@ -320,199 +319,137 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
         [LineString(ls.coords) for ls in finish_paths]
     )
 
-# --- Vカーブ用 高度化ロジック (グラフ理論によるパス結合) ---
+# --- Vカーブ グラフ理論ロジック ---
 
 class PathGraph:
     def __init__(self):
-        self.adj = {} # Adjacency list: point -> set of neighbors
-        self.nodes = {} # point -> data (optional)
-
+        self.adj = {} 
     def add_edge(self, p1, p2):
-        # 座標を丸めてキーにする（浮動小数点の誤差対策）
         p1 = (round(p1[0], 3), round(p1[1], 3))
         p2 = (round(p2[0], 3), round(p2[1], 3))
-        
         if p1 == p2: return
-        
         if p1 not in self.adj: self.adj[p1] = set()
         if p2 not in self.adj: self.adj[p2] = set()
-        
         self.adj[p1].add(p2)
         self.adj[p2].add(p1)
-
     def prune_short_leaves(self, min_len=0.5):
-        """短い末端（ヒゲ）を削除する"""
         while True:
             pruned_count = 0
-            # 次数1のノード（末端）を探す
             leaves = [node for node, neighbors in self.adj.items() if len(neighbors) == 1]
-            
             for leaf in leaves:
-                if leaf not in self.adj: continue # 既に削除済み
+                if leaf not in self.adj: continue
                 neighbor = list(self.adj[leaf])[0]
-                
-                # 長さチェック
                 dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
-                
-                # 短い、かつ孤立した線分でない（隣人が2つ以上接続を持っている＝主要幹線に繋がっている）場合
                 if dist < min_len and len(self.adj[neighbor]) > 2:
-                    # 削除実行
                     self.adj[neighbor].remove(leaf)
                     del self.adj[leaf]
                     pruned_count += 1
-            
-            if pruned_count == 0:
-                break
-
+            if pruned_count == 0: break
     def get_chains(self):
-        """グラフを一筆書き（または長い連結線）のリストに変換する"""
         chains = []
         visited_edges = set()
-        
-        # 次数が奇数のノード（始点になりうる）または次数の多いノードから探索開始
-        # 優先度: 次数1(端点) > 次数3以上(分岐点) > 次数2(途中)
         sorted_nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n]) % 2 != 1, -len(self.adj[n])))
-        
         for start_node in sorted_nodes:
             if start_node not in self.adj: continue
-            
-            # このノードから出ている未訪問のエッジがあるか
             neighbors = list(self.adj[start_node])
             for next_node in neighbors:
                 edge_key = tuple(sorted((start_node, next_node)))
-                if edge_key in visited_edges:
-                    continue
-                
-                # 新しいチェーン開始
+                if edge_key in visited_edges: continue
                 current_chain = [start_node, next_node]
                 visited_edges.add(edge_key)
-                
                 curr = next_node
-                
-                # 一本道をたどる
                 while True:
-                    # 現在のノードの接続先を取得
                     n_neighbors = list(self.adj[curr])
-                    # 次に行くべき候補（まだ通ってなくて、戻る方向じゃないやつ）
                     candidates = []
                     for n in n_neighbors:
                         ek = tuple(sorted((curr, n)))
-                        if ek not in visited_edges:
-                            candidates.append(n)
-                    
-                    if len(candidates) == 0:
-                        break # 行き止まり
+                        if ek not in visited_edges: candidates.append(n)
+                    if len(candidates) == 0: break
                     elif len(candidates) == 1:
-                        # 道なりに進む
                         nxt = candidates[0]
                         visited_edges.add(tuple(sorted((curr, nxt))))
                         current_chain.append(nxt)
                         curr = nxt
-                        
-                        # もし分岐点に到達したら、一旦そこでチェーンを切る（VCarve的な挙動）
-                        if len(self.adj[curr]) > 2:
-                            break
-                    else:
-                        # 分岐点にいる場合、最も角度が緩やかな（直進に近い）ものを選ぶロジック等が考えられるが
-                        # ここでは単純に最初の候補を選んでチェーン終了（残りは別チェーンとして処理）
-                        break
-                
-                if len(current_chain) > 1:
-                    chains.append(current_chain)
-                    
+                        if len(self.adj[curr]) > 2: break
+                    else: break
+                if len(current_chain) > 1: chains.append(current_chain)
         return chains
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     polys = ensure_list_of_polys(geometry)
     all_paths = []
     tan_a = np.tan(np.radians(angle_deg/2))
-    
-    # グラフ構築
     graph = PathGraph()
-    
     for poly in polys:
-        # 1. 境界線のサンプリング (精度向上)
-        # Simplifyを弱めて、形状の再現性を高める
-        simple = poly.simplify(0.02) 
+        simple = poly.simplify(0.02)
         line = simple.exterior
         length = line.length
-        
-        # ボロノイ母点の生成密度を上げる（滑らかさのため）
-        num = int(length / 0.5) # 0.5mm間隔
+        num = int(length / 0.5) 
         if num < 50: num = 50
         if num > 2000: num = 2000
-        
         pts = [line.interpolate(i * length / num) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
-        
-        try:
-            vor = Voronoi(coords)
-        except:
-            continue
-            
-        # 2. ボロノイ辺の抽出とフィルタリング
-        # "Medial Axis" に近いものだけを残す
+        try: vor = Voronoi(coords)
+        except: continue
         for p1i, p2i in vor.ridge_vertices:
             if p1i < 0 or p2i < 0: continue
             p1 = vor.vertices[p1i]
             p2 = vor.vertices[p2i]
-            
-            # ポリゴン内部にあるかチェック
-            # 両端が内部にあれば採用（厳密には交差判定すべきだが、高密度ならこれで概ねOK）
             if simple.contains(Point(p1)) and simple.contains(Point(p2)):
                 graph.add_edge(p1, p2)
-
-    # 3. グラフのクリーニング（短いヒゲの削除）
-    graph.prune_short_leaves(min_len=0.5) # 0.5mm以下の孤立枝を削除
-
-    # 4. パスの結合（チェーン化）
+    
+    graph.prune_short_leaves(min_len=0.5)
     raw_chains = graph.get_chains()
     
-    # 5. Z高さの計算と3Dパス生成
     for chain in raw_chains:
         path_3d = []
-        # チェーンをLineStringとして扱い、サンプリングしてZを計算
         if len(chain) < 2: continue
-        
         ls = LineString(chain)
-        # 長いパスは適度に分割してZ高さを滑らかにする
         pts_count = int(ls.length / step_len) + 1
         if pts_count < 2: pts_count = 2
-        
         for i in range(pts_count):
-            # 補間点
             pt = ls.interpolate(i * ls.length / (pts_count - 1)) if pts_count > 1 else Point(chain[0])
-            
-            # 最寄りの境界線までの距離 (これがVカーブの深さになる)
-            # 全ポリゴンに対してチェックするのは重いが、正確性を重視
             d = 0
             for poly in polys:
                 d_temp = poly.exterior.distance(pt)
-                # 内部にいるポリゴンの距離を採用（包含判定は省略、距離が小さいものがそれ）
-                if d == 0 or d_temp < d:
-                    d = d_temp
-            
-            # 穴（Interiors）との距離もチェック
+                if d == 0 or d_temp < d: d = d_temp
             for poly in polys:
                 for interior in poly.interiors:
                     d_hole = interior.distance(pt)
                     if d_hole < d: d = d_hole
-
-            # Z深さ計算
             z = -(d / tan_a)
             if use_limit:
                 if z < max_d: z = max_d
-            
             path_3d.append((pt.x, pt.y, z))
-            
         if len(path_3d) > 1:
-            # 6. ダグラス・プーカス法で点数を間引いてGコードを軽くする
             simplified_3d = douglas_peucker(path_3d, 0.02)
             all_paths.append(simplified_3d)
-                
     return all_paths
 
-# ★ Gコード生成 (層優先 & ランピング進入)
+def generate_helical_entry(x, y, z_start, z_target, r_helix, feed, G1):
+    gc = []
+    depth_per_turn = 1.0 
+    total_depth = z_start - z_target
+    if total_depth <= 0: return []
+    turns = math.ceil(total_depth / depth_per_turn)
+    if turns < 1: turns = 1
+    segs_per_turn = 16
+    angle_step = 2 * math.pi / segs_per_turn
+    z_step = (z_start - z_target) / (turns * segs_per_turn)
+    current_z = z_start
+    current_angle = 0.0
+    start_x = x + r_helix
+    start_y = y
+    gc.append(f"{G1} X{start_x:.3f} Y{start_y:.3f}")
+    for i in range(turns * segs_per_turn):
+        current_angle += angle_step
+        current_z -= z_step
+        next_x = x + r_helix * math.cos(current_angle)
+        next_y = y + r_helix * math.sin(current_angle)
+        gc.append(f"{G1} X{next_x:.3f} Y{next_y:.3f} Z{current_z:.3f}")
+    gc.append(f"{G1} X{x:.3f} Y{y:.3f} Z{z_target:.3f}")
+    return gc
+
 def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01", is_3d=False):
     gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06"]
     G0 = "G0" if "G0/" in fmt else "G00"
@@ -528,7 +465,7 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
         z_start = phase.get('z_start', 0)
         z_final = phase.get('z_final', 0)
         z_step = phase.get('z_step', abs(z_final - z_start))
-        use_ramp = phase.get('use_ramp', False) # 変数名変更: helical -> ramp
+        use_ramp = phase.get('use_ramp', False)
         
         if z_step <= 0: z_step = abs(z_final - z_start)
         
@@ -545,95 +482,56 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
                     gc.append(f"{G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
                 gc.append(f"{G0} Z{safe}")
         else:
-            # 2Dパス (層優先: Level-First)
             current_z = z_start
-            
             while current_z > z_final:
                 target_z = current_z - z_step
                 if target_z < z_final: target_z = z_final
                 
-                # この深さですべてのパスを処理
                 for path in paths:
                     coords = np.array(path.coords)
                     if len(coords) < 2: continue
-                    
                     start_x, start_y = coords[0,0], coords[0,1]
-                    
-                    # 開始位置へ
                     gc.append(f"{G0} X{start_x:.3f} Y{start_y:.3f}")
-                    # 直前のZ高さへアプローチ (安全マージン +1.0)
                     gc.append(f"{G0} Z{current_z + 1.0}")
                     
-                    # --- 進入動作 (Ramp or Plunge) ---
                     if use_ramp:
-                        # ランピング: パスに沿って斜めに降りる
-                        # 最初のセグメント等を使って徐々にZを下げる
-                        # ここでは簡単のため、全周または十分な距離を使って下げるロジック
-                        
                         path_len = path.length
                         if path_len == 0: continue
-                        
-                        # ランピング開始 (現在のZからターゲットZへ)
-                        # 各ポイントでのZを補間計算して出力
                         dist_accum = 0.0
                         z_diff = current_z - target_z
-                        
-                        # 始点は current_z
-                        
-                        # パスの各点を辿りながらZを下げる
                         reached_target = False
-                        
                         for j in range(1, len(coords)):
                             p_curr = coords[j]
                             p_prev = coords[j-1]
                             seg_len = np.linalg.norm(p_curr - p_prev)
                             dist_accum += seg_len
-                            
-                            # Z計算 (線形補間)
-                            # 全周の半分くらいの距離で降りきる設定にする (急降下防止)
-                            ramp_dist = min(path_len, 100.0) # 最大100mmかけて降りる
-                            
+                            ramp_dist = min(path_len, 100.0)
                             ratio = dist_accum / ramp_dist
                             if ratio > 1.0: ratio = 1.0
-                            
                             interp_z = current_z - (z_diff * ratio)
-                            
                             gc.append(f"{G1} X{p_curr[0]:.3f} Y{p_curr[1]:.3f} Z{interp_z:.3f}")
-                            
                             if ratio >= 1.0:
                                 reached_target = True
-                                # 残りのパスをターゲットZで回る
                                 for k in range(j+1, len(coords)):
                                     p_rem = coords[k]
                                     gc.append(f"{G1} X{p_rem[0]:.3f} Y{p_rem[1]:.3f} Z{target_z:.3f}")
                                 break
-                        
-                        # もしパスが短すぎて降りきれなかった場合 (短い円など)
                         if not reached_target:
-                            # 残りを垂直に下げる (やむなし) か、もう一周するロジックが必要だが
-                            # ここでは単純に最終Zへ移動
                             gc.append(f"{G1} Z{target_z:.3f}")
-
                     else:
-                        # 通常プランジ (垂直降下)
                         gc.append(f"{G1} Z{target_z:.3f}")
-                        # パス切削
                         for xy in coords[1:]:
                             gc.append(f"{G1} X{xy[0]:.3f} Y{xy[1]:.3f}")
-                    
-                    # 1パス終了後、リトラクト
                     gc.append(f"{G0} Z{safe}")
-                
                 current_z = target_z
-
     gc.append(footer.strip())
     return "\n".join(gc)
 
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 1.4")
-st.caption("Ver 1.4: 仕上げ設定復旧 & ランピング進入(壁干渉回避)")
+st.title("⚡ yosikeiCAM 1.5")
+st.caption("Ver 1.5: Vカーブ品質向上(グラフ理論版)・機能完全統合")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -662,7 +560,6 @@ with st.sidebar:
         st.caption("▼ 送り速度設定")
         feed_p_rough = st.number_input("粗送り速度 (mm/min)", value=300, min_value=1, max_value=None, step=50, key="fp_r")
         
-        # 仕上げ設定のUIロジック修正
         feed_p_finish = feed_p_rough
         finish_mode = "Step-down"
         
