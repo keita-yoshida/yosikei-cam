@@ -72,14 +72,10 @@ def dist_lseg(l1, l2, p):
 
 def douglas_peucker(points, tolerance):
     if len(points) < 3: return points
-    dmax = 0
-    index = 0
-    end = len(points) - 1
+    dmax = 0; index = 0; end = len(points) - 1
     for i in range(1, end):
         d = dist_lseg(points[0], points[end], points[i])
-        if d > dmax:
-            index = i
-            dmax = d
+        if d > dmax: index = i; dmax = d
     if dmax > tolerance:
         return douglas_peucker(points[:index+1], tolerance)[:-1] + douglas_peucker(points[index:], tolerance)
     else:
@@ -97,32 +93,19 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
         if coords[0] == coords[-1]: coords.pop()
         num_pts = len(coords)
         for i in range(num_pts):
-            p_curr = np.array(coords[i])
-            p_prev = np.array(coords[(i - 1) % num_pts])
-            p_next = np.array(coords[(i + 1) % num_pts])
-            v1 = p_curr - p_prev
-            v2 = p_next - p_curr
-            n1 = np.linalg.norm(v1)
-            n2 = np.linalg.norm(v2)
+            p_curr = np.array(coords[i]); p_prev = np.array(coords[(i-1)%num_pts]); p_next = np.array(coords[(i+1)%num_pts])
+            v1 = p_curr - p_prev; v2 = p_next - p_curr; n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
             if n1 < 1e-6 or n2 < 1e-6: continue
-            v1 /= n1; v2 /= n2
-            cross = np.cross(v1, v2)
-            dot = np.dot(v1, v2)
-            angle_deg = math.degrees(math.atan2(cross, dot))
+            v1 /= n1; v2 /= n2; cross = np.cross(v1, v2); dot = np.dot(v1, v2); angle_deg = math.degrees(math.atan2(cross, dot))
             if 5 < abs(angle_deg) < 175:
-                bisector = v2 - v1
-                bn = np.linalg.norm(bisector)
+                bisector = v2 - v1; bn = np.linalg.norm(bisector)
                 if bn > 1e-6:
-                    bisector /= bn
-                    test_pt = p_curr + bisector * 0.01
+                    bisector /= bn; test_pt = p_curr + bisector * 0.01
                     if not poly.contains(Point(test_pt)): bisector = -bisector
                     half_angle_rad = math.radians((180 - abs(angle_deg)) / 2)
                     if half_angle_rad < 0.1: half_angle_rad = 0.1
-                    dist_theoretical = r / math.sin(half_angle_rad)
-                    offset = (dist_theoretical - r) + (r * 0.05)
-                    center = p_curr + bisector * offset
-                    circle = Point(center).buffer(r, resolution=16)
-                    dogbone_circles.append(circle)
+                    dist_theoretical = r / math.sin(half_angle_rad); offset = (dist_theoretical - r) + (r * 0.05); center = p_curr + bisector * offset
+                    circle = Point(center).buffer(r, resolution=16); dogbone_circles.append(circle)
     if not dogbone_circles: return polygon
     try: return unary_union([polygon] + dogbone_circles).simplify(0.001)
     except: return polygon
@@ -215,34 +198,26 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     G0 = "G0" if "G0/" in fmt else "G00"; G1 = "G1" if "G0/" in fmt else "G01"; safe = 5.0
     for pt in points:
         x, y = pt.x, pt.y
-        gc.append(f"; Drill Hole at X{x:.3f} Y{y:.3f}")
-        gc.append(f"{G0} X{x:.3f} Y{y:.3f}")
-        gc.append(f"{G0} Z{z_start + 1.0}")
+        gc.append(f"; Drill Hole at X{x:.3f} Y{y:.3f}"); gc.append(f"{G0} X{x:.3f} Y{y:.3f}"); gc.append(f"{G0} Z{z_start + 1.0}")
         current_z = z_start
         while current_z > z_final:
-            target_z = current_z - peck_depth
-            if target_z < z_final: target_z = z_final
+            target_z = max(current_z - peck_depth, z_final)
             gc.append(f"{G1} Z{target_z:.3f}")
-            if target_z > z_final:
-                gc.append(f"{G0} Z{z_start + 0.5}"); gc.append(f"{G0} Z{target_z + 0.5}")
+            if target_z > z_final: gc.append(f"{G0} Z{z_start + 0.5}"); gc.append(f"{G0} Z{target_z + 0.5}")
             current_z = target_z
         gc.append(f"{G0} Z{safe}")
-    gc.append(footer.strip())
-    return "\n".join(gc)
+    gc.append(footer.strip()); return "\n".join(gc)
 
 # --- 4. パス生成 ---
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
-    paths_rough = []; paths_finish = []
-    r = tool_d / 2.0; step = tool_d * stepover
-    offset_rough = -(r + clearance)
+    paths_rough = []; paths_finish = []; r = tool_d / 2.0; step = tool_d * stepover; offset_rough = -(r + clearance)
     try: current_rough = geometry.buffer(offset_rough, join_style=2)
     except: current_rough = Polygon()
     while not current_rough.is_empty and current_rough.area > 0.01:
         current_polys = ensure_list_of_polys(current_rough)
         if not current_polys: break
-        for p in current_polys:
-            paths_rough.append(p.exterior); paths_rough.extend(p.interiors)
+        for p in current_polys: paths_rough.append(p.exterior); paths_rough.extend(p.interiors)
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
     if clearance > 0:
@@ -250,10 +225,8 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
         offset_finish = -r
         try:
-            finish_pass = work_geom_finish.buffer(offset_finish, join_style=2)
-            finish_polys = ensure_list_of_polys(finish_pass)
-            for p in finish_polys:
-                paths_finish.append(p.exterior); paths_finish.extend(p.interiors)
+            finish_pass = work_geom_finish.buffer(offset_finish, join_style=2); finish_polys = ensure_list_of_polys(finish_pass)
+            for p in finish_polys: paths_finish.append(p.exterior); paths_finish.extend(p.interiors)
         except: pass
     return ([LineString(p.coords) for p in paths_rough if p.length > 0.1], [LineString(p.coords) for p in paths_finish if p.length > 0.1])
 
@@ -271,7 +244,7 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
     except: pass
     return ([LineString(ls.coords) for ls in rough_paths], [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ グラフ理論ロジック ---
+# --- Vカーブ グラフ理論 & フィルタ強化 ---
 
 class PathGraph:
     def __init__(self): self.adj = {}
@@ -281,15 +254,13 @@ class PathGraph:
         if p1 not in self.adj: self.adj[p1] = set()
         if p2 not in self.adj: self.adj[p2] = set()
         self.adj[p1].add(p2); self.adj[p2].add(p1)
-    def prune_short_leaves(self, min_len=0.5):
-        for _ in range(5):
+    def prune_short_leaves(self, min_len=2.0):
+        for _ in range(10):
             pruned_count = 0; leaves = [node for node, neighbors in self.adj.items() if len(neighbors) == 1]
             for leaf in leaves:
                 if leaf not in self.adj: continue
-                neighbor = list(self.adj[leaf])[0]
-                dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
-                if dist < min_len and len(self.adj[neighbor]) > 2:
-                    self.adj[neighbor].remove(leaf); del self.adj[leaf]; pruned_count += 1
+                neighbor = list(self.adj[leaf])[0]; dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
+                if dist < min_len and len(self.adj[neighbor]) > 2: self.adj[neighbor].remove(leaf); del self.adj[leaf]; pruned_count += 1
             if pruned_count == 0: break
     def get_chains(self):
         chains = []; visited_edges = set(); sorted_nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n]) % 2 != 1, -len(self.adj[n])))
@@ -312,25 +283,22 @@ class PathGraph:
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     polys = ensure_list_of_polys(geometry); all_paths = []; tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
     for poly in polys:
-        simple = poly.simplify(0.01); line = simple.exterior; length = line.length; sample_res = 0.3
-        num = int(length / sample_res)
-        if num < 50: num = 50
-        if num > 4000: num = 4000
-        pts = [line.interpolate(i * length / num) for i in range(num)]
+        smooth_poly = poly.simplify(0.05, preserve_topology=True) # 輪郭を少し整理してノイズを抑制
+        line = smooth_poly.exterior; length = line.length; sample_res = 0.2
+        num = max(50, min(6000, int(length / sample_res))); pts = [line.interpolate(i * length / (num-1)) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
         try: vor = Voronoi(coords)
         except: continue
         for (p1_idx, p2_idx), (v1_idx, v2_idx) in zip(vor.ridge_points, vor.ridge_vertices):
             if v1_idx < 0 or v2_idx < 0: continue
             v1, v2 = vor.vertices[v1_idx], vor.vertices[v2_idx]
-            if not simple.contains(Point(v1)) or not simple.contains(Point(v2)): continue
+            if not smooth_poly.contains(Point(v1)) or not smooth_poly.contains(Point(v2)): continue
             g1, g2 = vor.points[p1_idx], vor.points[p2_idx]
-            if np.linalg.norm(g1 - g2) < sample_res * 2.8: continue
+            if np.linalg.norm(g1 - g2) < sample_res * 5.0: continue # 隣接点ノイズを厳しくカット
             graph.add_edge(v1, v2)
-    graph.prune_short_leaves(min_len=1.0); raw_chains = graph.get_chains()
+    graph.prune_short_leaves(min_len=2.0); raw_chains = graph.get_chains()
     for chain in raw_chains:
-        path_3d = []; ls = LineString(chain); pts_count = int(ls.length / step_len) + 1
-        if pts_count < 2: pts_count = 2
+        path_3d = []; ls = LineString(chain); pts_count = max(2, int(ls.length / step_len) + 1)
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1)); d = poly.distance(pt); z = -(d / tan_a)
             if use_limit and z < max_d: z = max_d
@@ -345,8 +313,7 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
     for i, phase in enumerate(phases):
         paths = phase.get('paths', [])
         if not paths: continue
-        feed = int(phase.get('feed', 300)); z_start = phase.get('z_start', 0); z_final = phase.get('z_final', 0); z_step = phase.get('z_step', abs(z_final - z_start)); use_ramp = phase.get('use_ramp', False)
-        if z_step <= 0: z_step = abs(z_final - z_start)
+        feed = int(phase.get('feed', 300)); z_start = phase.get('z_start', 0); z_final = phase.get('z_final', 0); z_step = max(0.01, phase.get('z_step', abs(z_final - z_start))); use_ramp = phase.get('use_ramp', False)
         gc.append(f"; --- Phase {i+1}: {phase.get('name','')} (F{feed}) ---"); gc.append(f"F{feed}")
         if is_3d:
             for path_pts in paths:
@@ -382,8 +349,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 6. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 1.7")
-st.caption("Ver 1.7: 構文エラー修正・Vカーブノイズ除去強化")
+st.title("⚡ yosikeiCAM 1.8")
+st.caption("Ver 1.8: 重複IDエラー修正・Vカーブノイズ(トゲ)強力除去")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -391,7 +358,7 @@ with st.sidebar:
     st.divider(); st.header("⚙️ 加工設定")
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     with tab1:
-        enable_pocket = st.checkbox("有効", True); st.divider()
+        enable_pocket = st.checkbox("有効", True, key="check_pocket"); st.divider()
         dia = st.number_input("工具径 (mm)", value=3.0, min_value=0.01, step=0.1, format="%.3f")
         clear = st.number_input("仕上げ代 (mm)", value=0.0, step=0.1)
         c1, c2 = st.columns(2)
@@ -405,21 +372,21 @@ with st.sidebar:
             st.markdown("---"); st.caption("▼ 仕上げ設定")
             c3, c4 = st.columns(2)
             with c3: feed_p_finish = st.number_input("仕上げ速度", value=300, min_value=1, step=50, key="fp_f")
-            with c4: finish_mode_opt = st.radio("仕上げ深さ", ["刻み", "一括"], index=0); finish_mode = "Full-Depth" if finish_mode_opt == "一括" else "Step-down"
+            with c4: finish_mode_opt = st.radio("仕上げ深さ", ["刻み", "一括"], index=0, key="finish_z_opt"); finish_mode = "Full-Depth" if finish_mode_opt == "一括" else "Step-down"
     with tab2:
-        enable_chamfer = st.checkbox("有効", True); st.divider()
+        enable_chamfer = st.checkbox("有効", True, key="check_chamfer"); st.divider()
         chamfer_w = st.number_input("幅 (mm)", 0.5, step=0.1); tip_off = st.number_input("刃先オフセット", value=1.0, min_value=0.0, step=0.1); z_c = -(chamfer_w + tip_off)
         feed_c_rough = st.number_input("速度", value=300, min_value=1, step=50, key="fc_r")
-        use_chamfer_finish = st.checkbox("2回加工", False); chamfer_finish_allowance = 0.0; feed_c_finish = 300
+        use_chamfer_finish = st.checkbox("2回加工", False, key="check_chamfer_finish"); chamfer_finish_allowance = 0.0; feed_c_finish = 300
         if use_chamfer_finish:
             c1, c2 = st.columns(2)
             with c1: chamfer_finish_allowance = st.number_input("代 (mm)", value=0.2, min_value=0.01, step=0.1)
-            with c2: feed_c_finish = st.number_input("仕上速度", value=300, min_value=1, step=50)
+            with c2: feed_c_finish = st.number_input("仕上速度", value=300, min_value=1, step=50, key="fc_f")
     with tab3:
-        enable_vcarve = st.checkbox("有効", False); st.divider(); v_ang = st.number_input("角度", 60.0, step=10.0); use_v_limit = st.checkbox("深さ制限", False)
-        v_lim = st.number_input("制限 (mm)", value=-3.0) if use_v_limit else -100.0; feed_v = st.number_input("速度", value=300, min_value=1, step=50); v_res = st.slider("精度", 0.2, 0.02, 0.05)
+        enable_vcarve = st.checkbox("有効", False, key="check_vcarve"); st.divider(); v_ang = st.number_input("角度", 60.0, step=10.0); use_v_limit = st.checkbox("深さ制限", False)
+        v_lim = st.number_input("制限 (mm)", value=-3.0) if use_v_limit else -100.0; feed_v = st.number_input("速度", value=300, min_value=1, step=50, key="fv"); v_res = st.slider("精度", 0.2, 0.02, 0.05)
     with tab4:
-        enable_drill = st.checkbox("有効", False); st.divider(); drill_dia_target = st.number_input("穴径 (mm)", value=3.0, min_value=0.01, step=0.1); drill_depth = st.number_input("深さ Z", value=-5.0); peck_depth = st.number_input("ペック", value=2.0, min_value=0.1); feed_d = st.number_input("速度", value=200, min_value=1, step=50)
+        enable_drill = st.checkbox("有効", False, key="check_drill"); st.divider(); drill_dia_target = st.number_input("穴径 (mm)", value=3.0, min_value=0.01, step=0.1); drill_depth = st.number_input("深さ Z", value=-5.0); peck_depth = st.number_input("ペック", value=2.0, min_value=0.1); feed_d = st.number_input("速度", value=200, min_value=1, step=50, key="fd")
     st.divider(); pp_name = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys())); pp = POST_PROCESSORS[pp_name]
     with st.expander("Gコード詳細"): h_code = st.text_area("Header", pp["start"]); f_code = st.text_area("Footer", pp["end"])
 
@@ -433,7 +400,7 @@ if f:
         elif origin.startswith("Center"): offset_x, offset_y = -(minx+w/2), -(miny+h/2)
         polys_moved = [translate(p, offset_x, offset_y) for p in polys_raw]
         st.sidebar.divider(); st.sidebar.subheader("📐 パス選択"); selected_indices = []
-        container = st.sidebar.container(); all_checked = container.checkbox("すべて選択", value=True)
+        container = st.sidebar.container(); all_checked = container.checkbox("すべて選択", value=True, key="sel_all")
         for i, p in enumerate(polys_moved):
             is_checked = container.checkbox(f"Path #{i+1} (Area:{p.area:.1f})", value=all_checked, key=f"p_{i}")
             if is_checked: selected_indices.append(i)
