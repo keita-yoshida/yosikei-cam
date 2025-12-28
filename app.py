@@ -319,8 +319,6 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
         [LineString(ls.coords) for ls in finish_paths]
     )
 
-# --- Vカーブ グラフ理論ロジック ---
-
 # --- Vカーブ グラフ理論ロジック (ノイズ除去フィルター強化版) ---
 
 class PathGraph:
@@ -484,6 +482,7 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
             # データ量を減らすため少し間引く
             simplified_3d = douglas_peucker(path_3d, 0.02)
             all_paths.append(simplified_3d)
+            
             
     return all_paths
 
