@@ -773,5 +773,4 @@ if f:
             if enable_drill and 'drill_pts' in locals() and drill_pts:
                 st.success(f"ドリル穴: {len(drill_pts)}箇所")
             
-    else:
-        st.error("有効な閉じた図形が見つかりません。")
+    else:st.error("有効な閉じた図形が見つかりません。")
