@@ -320,48 +320,196 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
         [LineString(ls.coords) for ls in finish_paths]
     )
 
+# --- Vカーブ用 高度化ロジック (グラフ理論によるパス結合) ---
+
+class PathGraph:
+    def __init__(self):
+        self.adj = {} # Adjacency list: point -> set of neighbors
+        self.nodes = {} # point -> data (optional)
+
+    def add_edge(self, p1, p2):
+        # 座標を丸めてキーにする（浮動小数点の誤差対策）
+        p1 = (round(p1[0], 3), round(p1[1], 3))
+        p2 = (round(p2[0], 3), round(p2[1], 3))
+        
+        if p1 == p2: return
+        
+        if p1 not in self.adj: self.adj[p1] = set()
+        if p2 not in self.adj: self.adj[p2] = set()
+        
+        self.adj[p1].add(p2)
+        self.adj[p2].add(p1)
+
+    def prune_short_leaves(self, min_len=0.5):
+        """短い末端（ヒゲ）を削除する"""
+        while True:
+            pruned_count = 0
+            # 次数1のノード（末端）を探す
+            leaves = [node for node, neighbors in self.adj.items() if len(neighbors) == 1]
+            
+            for leaf in leaves:
+                if leaf not in self.adj: continue # 既に削除済み
+                neighbor = list(self.adj[leaf])[0]
+                
+                # 長さチェック
+                dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
+                
+                # 短い、かつ孤立した線分でない（隣人が2つ以上接続を持っている＝主要幹線に繋がっている）場合
+                if dist < min_len and len(self.adj[neighbor]) > 2:
+                    # 削除実行
+                    self.adj[neighbor].remove(leaf)
+                    del self.adj[leaf]
+                    pruned_count += 1
+            
+            if pruned_count == 0:
+                break
+
+    def get_chains(self):
+        """グラフを一筆書き（または長い連結線）のリストに変換する"""
+        chains = []
+        visited_edges = set()
+        
+        # 次数が奇数のノード（始点になりうる）または次数の多いノードから探索開始
+        # 優先度: 次数1(端点) > 次数3以上(分岐点) > 次数2(途中)
+        sorted_nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n]) % 2 != 1, -len(self.adj[n])))
+        
+        for start_node in sorted_nodes:
+            if start_node not in self.adj: continue
+            
+            # このノードから出ている未訪問のエッジがあるか
+            neighbors = list(self.adj[start_node])
+            for next_node in neighbors:
+                edge_key = tuple(sorted((start_node, next_node)))
+                if edge_key in visited_edges:
+                    continue
+                
+                # 新しいチェーン開始
+                current_chain = [start_node, next_node]
+                visited_edges.add(edge_key)
+                
+                curr = next_node
+                
+                # 一本道をたどる
+                while True:
+                    # 現在のノードの接続先を取得
+                    n_neighbors = list(self.adj[curr])
+                    # 次に行くべき候補（まだ通ってなくて、戻る方向じゃないやつ）
+                    candidates = []
+                    for n in n_neighbors:
+                        ek = tuple(sorted((curr, n)))
+                        if ek not in visited_edges:
+                            candidates.append(n)
+                    
+                    if len(candidates) == 0:
+                        break # 行き止まり
+                    elif len(candidates) == 1:
+                        # 道なりに進む
+                        nxt = candidates[0]
+                        visited_edges.add(tuple(sorted((curr, nxt))))
+                        current_chain.append(nxt)
+                        curr = nxt
+                        
+                        # もし分岐点に到達したら、一旦そこでチェーンを切る（VCarve的な挙動）
+                        if len(self.adj[curr]) > 2:
+                            break
+                    else:
+                        # 分岐点にいる場合、最も角度が緩やかな（直進に近い）ものを選ぶロジック等が考えられるが
+                        # ここでは単純に最初の候補を選んでチェーン終了（残りは別チェーンとして処理）
+                        break
+                
+                if len(current_chain) > 1:
+                    chains.append(current_chain)
+                    
+        return chains
+
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     polys = ensure_list_of_polys(geometry)
     all_paths = []
     tan_a = np.tan(np.radians(angle_deg/2))
+    
+    # グラフ構築
+    graph = PathGraph()
+    
     for poly in polys:
-        simple = poly.simplify(0.05)
+        # 1. 境界線のサンプリング (精度向上)
+        # Simplifyを弱めて、形状の再現性を高める
+        simple = poly.simplify(0.02) 
         line = simple.exterior
         length = line.length
-        num = int(length / step_len)
-        if num > 800: num = 800 
-        if num < 20: num = 20
+        
+        # ボロノイ母点の生成密度を上げる（滑らかさのため）
+        num = int(length / 0.5) # 0.5mm間隔
+        if num < 50: num = 50
+        if num > 2000: num = 2000
+        
         pts = [line.interpolate(i * length / num) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
-        try: vor = Voronoi(coords)
-        except: continue
-        segments = []
+        
+        try:
+            vor = Voronoi(coords)
+        except:
+            continue
+            
+        # 2. ボロノイ辺の抽出とフィルタリング
+        # "Medial Axis" に近いものだけを残す
         for p1i, p2i in vor.ridge_vertices:
             if p1i < 0 or p2i < 0: continue
             p1 = vor.vertices[p1i]
             p2 = vor.vertices[p2i]
+            
+            # ポリゴン内部にあるかチェック
+            # 両端が内部にあれば採用（厳密には交差判定すべきだが、高密度ならこれで概ねOK）
             if simple.contains(Point(p1)) and simple.contains(Point(p2)):
-                segments.append(LineString([p1, p2]))
-        if not segments: continue
-        merged = linemerge(segments)
-        lines = []
-        if merged.geom_type == 'LineString': lines = [merged]
-        elif merged.geom_type == 'MultiLineString': lines = list(merged.geoms)
-        else: lines = list(merged)
-        for l in lines:
-            l_pts = []
-            dist_pts = int(l.length / step_len) + 1
-            if dist_pts < 2: dist_pts = 2
-            for i in range(dist_pts):
-                pt = l.interpolate(i * step_len)
-                d = line.distance(pt)
-                z = -(d / tan_a)
-                if use_limit:
-                    if z < max_d: z = max_d
-                l_pts.append((pt.x, pt.y, z))
-            if len(l_pts) > 1:
-                l_pts = douglas_peucker(l_pts, 0.05)
-                all_paths.append(l_pts)
+                graph.add_edge(p1, p2)
+
+    # 3. グラフのクリーニング（短いヒゲの削除）
+    graph.prune_short_leaves(min_len=0.5) # 0.5mm以下の孤立枝を削除
+
+    # 4. パスの結合（チェーン化）
+    raw_chains = graph.get_chains()
+    
+    # 5. Z高さの計算と3Dパス生成
+    for chain in raw_chains:
+        path_3d = []
+        # チェーンをLineStringとして扱い、サンプリングしてZを計算
+        if len(chain) < 2: continue
+        
+        ls = LineString(chain)
+        # 長いパスは適度に分割してZ高さを滑らかにする
+        pts_count = int(ls.length / step_len) + 1
+        if pts_count < 2: pts_count = 2
+        
+        for i in range(pts_count):
+            # 補間点
+            pt = ls.interpolate(i * ls.length / (pts_count - 1)) if pts_count > 1 else Point(chain[0])
+            
+            # 最寄りの境界線までの距離 (これがVカーブの深さになる)
+            # 全ポリゴンに対してチェックするのは重いが、正確性を重視
+            d = 0
+            for poly in polys:
+                d_temp = poly.exterior.distance(pt)
+                # 内部にいるポリゴンの距離を採用（包含判定は省略、距離が小さいものがそれ）
+                if d == 0 or d_temp < d:
+                    d = d_temp
+            
+            # 穴（Interiors）との距離もチェック
+            for poly in polys:
+                for interior in poly.interiors:
+                    d_hole = interior.distance(pt)
+                    if d_hole < d: d = d_hole
+
+            # Z深さ計算
+            z = -(d / tan_a)
+            if use_limit:
+                if z < max_d: z = max_d
+            
+            path_3d.append((pt.x, pt.y, z))
+            
+        if len(path_3d) > 1:
+            # 6. ダグラス・プーカス法で点数を間引いてGコードを軽くする
+            simplified_3d = douglas_peucker(path_3d, 0.02)
+            all_paths.append(simplified_3d)
+                
     return all_paths
 
 # ★ Gコード生成 (層優先 & ランピング進入)
