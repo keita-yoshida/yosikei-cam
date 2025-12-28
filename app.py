@@ -321,10 +321,14 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
 
 # --- Vカーブ グラフ理論ロジック ---
 
+# --- Vカーブ グラフ理論ロジック (ノイズ除去フィルター強化版) ---
+
 class PathGraph:
     def __init__(self):
         self.adj = {} 
+    
     def add_edge(self, p1, p2):
+        # 座標を丸めてキーにする（接続判定の精度確保）
         p1 = (round(p1[0], 3), round(p1[1], 3))
         p2 = (round(p2[0], 3), round(p2[1], 3))
         if p1 == p2: return
@@ -332,31 +336,44 @@ class PathGraph:
         if p2 not in self.adj: self.adj[p2] = set()
         self.adj[p1].add(p2)
         self.adj[p2].add(p1)
+
     def prune_short_leaves(self, min_len=0.5):
+        # 孤立した短い枝（ヒゲ）を再帰的に削除
         while True:
             pruned_count = 0
+            # 次数1のノード（末端）を探す
             leaves = [node for node, neighbors in self.adj.items() if len(neighbors) == 1]
             for leaf in leaves:
                 if leaf not in self.adj: continue
                 neighbor = list(self.adj[leaf])[0]
+                
+                # 枝の長さを計算
                 dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
+                
+                # 短い、かつ分岐点から生えている枝なら削除
                 if dist < min_len and len(self.adj[neighbor]) > 2:
                     self.adj[neighbor].remove(leaf)
                     del self.adj[leaf]
                     pruned_count += 1
             if pruned_count == 0: break
+
     def get_chains(self):
+        # グラフを一筆書きのパス（リストのリスト）に変換
         chains = []
         visited_edges = set()
+        # 端点(次数1)または分岐点(次数3以上)から探索を始める
         sorted_nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n]) % 2 != 1, -len(self.adj[n])))
+        
         for start_node in sorted_nodes:
             if start_node not in self.adj: continue
             neighbors = list(self.adj[start_node])
             for next_node in neighbors:
                 edge_key = tuple(sorted((start_node, next_node)))
                 if edge_key in visited_edges: continue
+                
                 current_chain = [start_node, next_node]
                 visited_edges.add(edge_key)
+                
                 curr = next_node
                 while True:
                     n_neighbors = list(self.adj[curr])
@@ -364,14 +381,17 @@ class PathGraph:
                     for n in n_neighbors:
                         ek = tuple(sorted((curr, n)))
                         if ek not in visited_edges: candidates.append(n)
+                    
                     if len(candidates) == 0: break
                     elif len(candidates) == 1:
                         nxt = candidates[0]
                         visited_edges.add(tuple(sorted((curr, nxt))))
                         current_chain.append(nxt)
                         curr = nxt
+                        # 分岐点に到達したらチェーンを切る（重要）
                         if len(self.adj[curr]) > 2: break
                     else: break
+                
                 if len(current_chain) > 1: chains.append(current_chain)
         return chains
 
@@ -379,51 +399,92 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     polys = ensure_list_of_polys(geometry)
     all_paths = []
     tan_a = np.tan(np.radians(angle_deg/2))
+    
     graph = PathGraph()
+    
     for poly in polys:
-        simple = poly.simplify(0.02)
+        # 1. 輪郭のサンプリング
+        # 精度を上げるためsimplifyの許容値を小さく
+        simple = poly.simplify(0.01)
         line = simple.exterior
         length = line.length
-        num = int(length / 0.5) 
+        
+        # 点の密度：0.5mm間隔程度
+        sample_res = 0.5 
+        num = int(length / sample_res) 
         if num < 50: num = 50
-        if num > 2000: num = 2000
+        if num > 3000: num = 3000
+        
         pts = [line.interpolate(i * length / num) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
-        try: vor = Voronoi(coords)
-        except: continue
-        for p1i, p2i in vor.ridge_vertices:
-            if p1i < 0 or p2i < 0: continue
-            p1 = vor.vertices[p1i]
-            p2 = vor.vertices[p2i]
-            if simple.contains(Point(p1)) and simple.contains(Point(p2)):
-                graph.add_edge(p1, p2)
+        
+        try:
+            vor = Voronoi(coords)
+        except:
+            continue
+            
+        # 2. ボロノイ辺のフィルタリング（ここが改良点）
+        # vor.ridge_points: この辺を生成した「元データの2点」のインデックス
+        # vor.ridge_vertices: この辺の両端（ボロノイ頂点）のインデックス
+        
+        for (p1_idx, p2_idx), (v1_idx, v2_idx) in zip(vor.ridge_points, vor.ridge_vertices):
+            # 無限遠点(-1)を含む辺は除外
+            if v1_idx < 0 or v2_idx < 0: continue
+            
+            # ボロノイ頂点の座標
+            v1 = vor.vertices[v1_idx]
+            v2 = vor.vertices[v2_idx]
+            
+            # ポリゴン内部にあるかチェック
+            if not simple.contains(Point(v1)) or not simple.contains(Point(v2)):
+                continue
+
+            # ★★★ フィルター処理の核心 ★★★
+            # この線分を作った「輪郭上の2点」を取得
+            g1 = vor.points[p1_idx]
+            g2 = vor.points[p2_idx]
+            
+            # 輪郭上の2点が「近すぎる」場合、それは輪郭の凹凸から生じたノイズ（ヒゲ）なので捨てる
+            # 閾値はサンプリング間隔の1.5倍程度に設定
+            dist_generators = np.linalg.norm(g1 - g2)
+            if dist_generators < sample_res * 1.5:
+                continue
+            
+            # 合格したエッジだけをグラフに追加
+            graph.add_edge(v1, v2)
     
+    # 3. 残った微細なヒゲを掃除
     graph.prune_short_leaves(min_len=0.5)
+    
+    # 4. パスの結合と3D化
     raw_chains = graph.get_chains()
     
     for chain in raw_chains:
         path_3d = []
         if len(chain) < 2: continue
+        
         ls = LineString(chain)
+        # 滑らかにZを変化させるため、パスに沿って再サンプリング
         pts_count = int(ls.length / step_len) + 1
         if pts_count < 2: pts_count = 2
+        
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1)) if pts_count > 1 else Point(chain[0])
-            d = 0
-            for poly in polys:
-                d_temp = poly.exterior.distance(pt)
-                if d == 0 or d_temp < d: d = d_temp
-            for poly in polys:
-                for interior in poly.interiors:
-                    d_hole = interior.distance(pt)
-                    if d_hole < d: d = d_hole
+            
+            # 最寄りの壁までの距離 = 切込み深さ
+            d = poly.distance(pt) # Polygon.distanceは境界までの最短距離を返す
+            
             z = -(d / tan_a)
             if use_limit:
                 if z < max_d: z = max_d
+            
             path_3d.append((pt.x, pt.y, z))
+            
         if len(path_3d) > 1:
+            # データ量を減らすため少し間引く
             simplified_3d = douglas_peucker(path_3d, 0.02)
             all_paths.append(simplified_3d)
+            
     return all_paths
 
 def generate_helical_entry(x, y, z_start, z_target, r_helix, feed, G1):
