@@ -319,7 +319,7 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
         [LineString(ls.coords) for ls in finish_paths]
     )
 
-# --- Vカーブ グラフ理論ロジック (ヒゲ除去強化版) ---
+# --- Vカーブ グラフ理論ロジック ---
 
 class PathGraph:
     def __init__(self):
@@ -335,7 +335,6 @@ class PathGraph:
         self.adj[p2].add(p1)
 
     def prune_short_leaves(self, min_len=0.5):
-        # 繰り返し削除して深いヒゲも消す
         for _ in range(3):
             pruned_count = 0
             leaves = [node for node, neighbors in self.adj.items() if len(neighbors) == 1]
@@ -387,14 +386,13 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     graph = PathGraph()
     
     for poly in polys:
-        # サンプリング密度を向上 (0.5 -> 0.2)
         simple = poly.simplify(0.01)
         line = simple.exterior
         length = line.length
         sample_res = 0.2
         num = int(length / sample_res) 
         if num < 50: num = 50
-        if num > 5000: num = 5000 # 上限緩和
+        if num > 5000: num = 5000
         
         pts = [line.interpolate(i * length / num) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
@@ -410,12 +408,10 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
             if not simple.contains(Point(v1)) or not simple.contains(Point(v2)):
                 continue
 
-            # ★ ノイズ除去: 元の点同士が近すぎる(隣接点)なら、その境界線はヒゲなので無視
             g1 = vor.points[p1_idx]
             g2 = vor.points[p2_idx]
             dist_generators = np.linalg.norm(g1 - g2)
             
-            # 閾値: サンプリング間隔の2.5倍未満なら「隣の点」とみなす
             if dist_generators < sample_res * 2.5:
                 continue
             
@@ -579,7 +575,6 @@ with st.sidebar:
         feed_p_finish = feed_p_rough
         finish_mode = "Step-down"
         
-        # 仕上げUI (常に表示する形に変更し、無効時はdisabledに見せる手もあるが、シンプルに表示)
         if clear > 0:
             st.markdown("---")
             st.caption("▼ 仕上げ設定 (仕上げ代 > 0 のため有効)")
@@ -773,4 +768,5 @@ if f:
             if enable_drill and 'drill_pts' in locals() and drill_pts:
                 st.success(f"ドリル穴: {len(drill_pts)}箇所")
             
-    else:st.error("有効な閉じた図形が見つかりません。")
+    else:
+        st.error("有効な閉じた図形が見つかりません。")
