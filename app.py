@@ -184,10 +184,12 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         return p.centroid
     for p in polys:
         pt = check_p(p)
-        if pt: drill_points.append(pt)
+        if pt:
+            drill_points.append(pt)
         for interior in p.interiors:
             pt = check_p(Polygon(interior))
-            if pt: drill_points.append(pt)
+            if pt:
+                drill_points.append(pt)
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -235,7 +237,7 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
     except: pass
     return ([LineString(ls.coords) for ls in rough_paths], [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ ロジック ---
+# --- Vカーブ グラフ理論ロジック ---
 
 class PathGraph:
     def __init__(self): self.adj = {}
@@ -272,7 +274,7 @@ class PathGraph:
         return chains
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
-polys = ensure_list_of_polys(geometry)
+    polys = ensure_list_of_polys(geometry)
     if not polys:
         return []
     tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
@@ -330,8 +332,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 2.5")
-st.caption("Ver 2.5: 面積表示・仕上げ詳細設定の復活版")
+st.title("⚡ yosikeiCAM 2.7")
+st.caption("Ver 2.7: インデント・文法エラー完全修正版")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -378,7 +380,7 @@ with st.sidebar:
         va = st.number_input("角度 (度)", value=60.0, step=10.0)
         uvl = st.checkbox("深さ制限", value=False); vl = st.number_input("最大深さ (mm)", value=-3.0) if uvl else -100.0
         fed_v = st.number_input("速度", value=300, min_value=1, key="fv")
-        vr = st.slider("計算精度 (粗---密)", value=0.05, min_value=0.02, max_value=0.2)
+        vr = st.slider("精度", value=0.05, min_value=0.02, max_value=0.2)
         
     with tab4:
         enable_d = st.checkbox("有効", value=False, key="cd")
@@ -416,6 +418,7 @@ if f:
             fig, ax = plt.subplots(figsize=(5,5)); ax.plot(0, 0, 'r+', markersize=20); ax.axhline(0, color='red', alpha=0.3); ax.axvline(0, color='red', alpha=0.3)
             for i, p in enumerate(polys_moved):
                 ax.plot(*p.exterior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
+                for interior in p.interiors: ax.plot(*interior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
             ax.axis('equal'); ax.grid(True, linestyle=':'); st.pyplot(fig)
             
         with c2:
