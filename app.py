@@ -321,7 +321,7 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
     return ([LineString(ls.coords) for ls in rough_paths], 
             [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ グラフ理論ロジック ---
+# --- Vカーブ グラフ理論ロジック (Ver 2.1) ---
 
 class PathGraph:
     def __init__(self):
@@ -343,13 +343,14 @@ class PathGraph:
             if leaf not in self.adj: continue
             neighbor = list(self.adj[leaf])[0]
             dist = math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2)
+            # 分岐点から伸びる短い枝を消す
             if dist < min_len and len(self.adj[neighbor]) > 2:
                 self.adj[neighbor].remove(leaf)
                 del self.adj[leaf]
                 pruned += 1
         return pruned
 
-    def prune_short_leaves(self, min_len=3.0):
+    def prune_short_leaves(self, min_len=4.0):
         for _ in range(15):
             if self.prune_logic(min_len) == 0:
                 break
@@ -387,6 +388,7 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     graph = PathGraph()
     
     for poly in polys:
+        # 入力図形を滑らかにする（ノイズ対策）
         smooth = poly.simplify(0.02, preserve_topology=True)
         line = smooth.exterior
         length = line.length
@@ -398,26 +400,41 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
             vor = Voronoi(coords)
         except:
             continue
+            
         for (p1_idx, p2_idx), (v1_idx, v2_idx) in zip(vor.ridge_points, vor.ridge_vertices):
             if v1_idx < 0 or v2_idx < 0: continue
             v1, v2 = vor.vertices[v1_idx], vor.vertices[v2_idx]
-            if not smooth.contains(Point(v1)) or not smooth.contains(Point(v2)): continue
+            
+            # ボロノイ頂点が図形の内側にあるか厳密にチェック
+            pv1, pv2 = Point(v1), Point(v2)
+            if not smooth.contains(pv1) or not smooth.contains(pv2): continue
+            
             g1, g2 = vor.points[p1_idx], vor.points[p2_idx]
-            if np.linalg.norm(g1 - g2) < sample_res * 4.0: continue
+            # 隣接点からのノイズを強力にカット
+            if np.linalg.norm(g1 - g2) < sample_res * 5.0: continue
+            
             graph.add_edge(v1, v2)
             
-    graph.prune_short_leaves(min_len=3.0)
+    graph.prune_short_leaves(min_len=4.0)
     raw_chains = graph.get_chains()
+    
     for chain in raw_chains:
         path_3d = []
         ls = LineString(chain)
         pts_count = max(2, int(ls.length / step_len) + 1)
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1))
-            d = poly.distance(pt)
+            
+            # ★ 重要: 図形の「境界線」までの距離を正しく測る ★
+            # 点が内側にあっても0にならないように exterior と interiors を直接使う
+            d = pt.distance(smooth.exterior)
+            for interior in smooth.interiors:
+                d = min(d, pt.distance(interior))
+            
             z = -(d / tan_a)
             if use_limit and z < max_d: z = max_d
             path_3d.append((pt.x, pt.y, z))
+            
         if len(path_3d) > 1:
             all_paths.append(douglas_peucker(path_3d, 0.02))
     return all_paths
@@ -488,8 +505,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 6. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 2.0")
-st.caption("Ver 2.0: 文法エラー修正・安定版")
+st.title("⚡ yosikeiCAM 2.1")
+st.caption("Ver 2.1: Vカーブ深さ計算修正・パス安定版")
 
 with st.sidebar:
     st.header("📍 原点設定")
