@@ -346,7 +346,7 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
     tan_a = np.tan(np.radians(angle_deg/2))
     graph = PathGraph()
     combined_geom = unary_union(polys)
-    boundary = combined_geom.boundary # 全壁面
+    boundary = combined_geom.boundary
     
     for poly in polys:
         smooth = poly.simplify(0.02, preserve_topology=True)
@@ -428,8 +428,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 6. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 2.3")
-st.caption("Ver 2.3: 文法エラー修正・安定版")
+st.title("⚡ yosikeiCAM 2.4")
+st.caption("Ver 2.4: TypeError修正・引数明示版")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -440,34 +440,34 @@ with st.sidebar:
     
     with tab1:
         enable_p = st.checkbox("有効", True, key="cp")
-        dia = st.number_input("工具径 (mm)", 3.0, step=0.1)
-        clear = st.number_input("代", 0.0, step=0.1)
+        dia = st.number_input("工具径 (mm)", value=3.0, step=0.1)
+        clear = st.number_input("代", value=0.0, step=0.1)
         c1, c2 = st.columns(2)
-        with c1: dep_p = st.number_input("深さ Z", -1.0, step=0.1)
-        with c2: stp_p = st.number_input("ピッチ", 1.0, min_value=0.01)
-        fed_p = st.number_input("送り速度", 300, key="fp")
+        with c1: dep_p = st.number_input("深さ Z", value=-1.0, step=0.1)
+        with c2: stp_p = st.number_input("ピッチ", value=1.0, min_value=0.01)
+        fed_p = st.number_input("送り速度", value=300, key="fp")
     
     with tab2:
         enable_c = st.checkbox("有効", True, key="cc")
-        cw = st.number_input("幅 (mm)", 0.5, step=0.1)
-        to = st.number_input("刃先オフセット", 1.0, step=0.1)
+        cw = st.number_input("幅 (mm)", value=0.5, step=0.1)
+        to = st.number_input("刃先オフセット", value=1.0, step=0.1)
         z_c = -(cw + to)
-        fed_c = st.number_input("送り速度", 300, key="fc")
+        fed_c = st.number_input("送り速度", value=300, key="fc")
         
     with tab3:
         enable_v = st.checkbox("有効", False, key="cv")
-        va = st.number_input("角度", 60.0, step=10.0)
+        va = st.number_input("角度", value=60.0, step=10.0)
         uvl = st.checkbox("深さ制限", False)
-        vl = st.number_input("制限 (mm)", -3.0) if uvl else -100.0
-        fed_v = st.number_input("速度", 300, key="fv")
+        vl = st.number_input("制限 (mm)", value=-3.0) if uvl else -100.0
+        fed_v = st.number_input("速度", value=300, key="fv")
         vr = st.slider("精度", 0.2, 0.02, 0.05)
         
     with tab4:
         enable_d = st.checkbox("有効", False, key="cd")
-        ddt = st.number_input("穴径 (mm)", 3.0)
-        ddz = st.number_input("深さ", -5.0)
-        pck = st.number_input("ペック", 2.0, min_value=0.1)
-        fed_d = st.number_input("送り", 200, key="fd")
+        ddt = st.number_input("穴径 (mm)", value=3.0)
+        ddz = st.number_input("深さ", value=-5.0)
+        pck = st.number_input("ペック", value=2.0, min_value=0.1)
+        fed_d = st.number_input("送り", value=200, key="fd")
         
     st.divider()
     ppn = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys()))
@@ -492,10 +492,10 @@ if f:
         st.sidebar.divider()
         st.sidebar.subheader("📐 パス選択")
         cont = st.sidebar.container()
-        all_c = cont.checkbox("すべて選択", True, key="sa")
+        all_c = cont.checkbox("すべて選択", value=True, key="sa")
         selected = []
         for i, p in enumerate(polys_moved):
-            if cont.checkbox(f"Path #{i+1}", all_c, key=f"p{i}"):
+            if cont.checkbox(f"Path #{i+1}", value=all_c, key=f"p{i}"):
                 selected.append(i)
                 
         target_polys = [polys_moved[i] for i in selected]
@@ -536,7 +536,7 @@ if f:
                 if enable_c:
                     rp, fp = generate_chamfer_separated(gfc, cw, to, 0.0)
                     c_disp = fp
-                    gc_c = make_gcode_phases_advanced([{'name':'Chamfer', 'paths': fp, 'z_start': 0, 'z_final': z_c, 'feed': fed_c}], "Chamfer", h_c, f_c, pp["format"])
+                    if fp: gc_c = make_gcode_phases_advanced([{'name':'Chamfer', 'paths': fp, 'z_start': 0, 'z_final': z_c, 'feed': fed_c}], "Chamfer", h_c, f_c, pp["format"])
 
                 if enable_d:
                     dpts = find_drill_points(gfc, ddt)
