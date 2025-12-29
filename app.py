@@ -272,7 +272,9 @@ class PathGraph:
         return chains
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
-    polys = ensure_list_of_polys(geometry); if not polys: return []
+polys = ensure_list_of_polys(geometry)
+    if not polys:
+        return []
     tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
     combined_geom = unary_union(polys); boundary = combined_geom.boundary 
     for poly in polys:
