@@ -85,7 +85,7 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    """角の角度を解析し、工具Rが入れない全ての角を逃がす新ロジック"""
+    """角の角度を解析し、工具Rが入れない全ての角を逃がす物理ロジック"""
     if polygon.is_empty:
         return polygon
     poly = make_valid(polygon).simplify(0.001)
@@ -95,7 +95,6 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
     r = tool_dia / 2.0
     dogbone_circles = []
     
-    # 外枠(Exterior)と穴(Interior)の両方をスキャン
     rings = [poly.exterior] + list(poly.interiors)
     for ring_idx, ring in enumerate(rings):
         coords = list(ring.coords)
@@ -116,33 +115,30 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
             v_in /= mag_in
             v_out /= mag_out
             
-            # 角の曲がり方向を判定 (ShapelyのポリゴンはExteriorが反時計回り)
+            # 角の曲がり方向を判定
             cross = v_in[0]*v_out[1] - v_in[1]*v_out[0]
-            # 工具が入れない角（ポケットの内角）を判定
             is_internal_corner = (cross > 0.01) if ring_idx == 0 else (cross < -0.01)
             
             if is_internal_corner:
-                # 角度二等分ベクトル (角の奥へ向かう方向)
                 bisector = v_out - v_in
                 blen = np.linalg.norm(bisector)
                 if blen < 1e-6: continue
                 bisector /= blen
                 
-                # 安全確認：実際に「材料がある方向」を向いているか微細なプローブでテスト
+                # 材料がある方向にベクトルを補正
                 probe = p_curr + bisector * 0.01
                 if ring_idx == 0:
                     if poly.contains(Point(probe)): bisector = -bisector
                 else:
                     if not poly.contains(Point(probe)): bisector = -bisector
                 
-                # 工具の中心を頂点から半径rの位置に置いて円を作成（これが逃げになる）
+                # 工具の中心を頂点から半径rの位置に置いて円を作成
                 center = p_curr + bisector * r
                 dogbone_circles.append(Point(center).buffer(r, resolution=16))
                     
     if not dogbone_circles:
         return polygon
     try:
-        # 図形に円を合体させて、工具パスが円の中心まで到達するように拡張する
         return unary_union([poly] + dogbone_circles).simplify(0.001)
     except:
         return polygon
@@ -244,7 +240,6 @@ def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
         try: current_rough = current_rough.buffer(-step, join_style=2)
         except: break
     
-    # 仕上げ (ドッグボーンを適用した図形からオフセット)
     work_geom_finish = geometry
     if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
     try:
@@ -303,7 +298,7 @@ class PathGraph:
         return chains
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offset=0.0):
-polys = ensure_list_of_polys(geometry)
+    polys = ensure_list_of_polys(geometry)
     if not polys:
         return []
     tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
@@ -362,8 +357,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 3.1")
-st.caption("Ver 3.1: 角度解析ドッグボーン & 2回加工・面積表示復活版")
+st.title("⚡ yosikeiCAM 3.2")
+st.caption("Ver 3.2: インデント修正・角度解析ドッグボーン・2回加工統合版")
 
 with st.sidebar:
     st.header("📍 原点設定")
