@@ -349,8 +349,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("yosikeiCAM 3.6")
-st.caption("Ver 3.6: レイアウト調整・加工サイズ配置変更版")
+st.title("yosikeiCAM 3.7")
+st.caption("Ver 3.7: プレビューグリッド同期版")
 
 with st.sidebar:
     st.header("原点設定")
@@ -432,18 +432,23 @@ if f:
             hs = analyze_holes(gfc)
             if hs: st.sidebar.info("検出された円: " + ", ".join([f"φ{d}({c}個)" for d, c in hs.items()]))
         
-        # 加工サイズとヘッダーの表示
+        # 加工サイズとヘッダー
         st.success(f"加工サイズ: {w_size:.1f} x {h_size:.1f} mm")
         st.header("パス生成")
         
         c1, c2 = st.columns(2)
         with c1:
-            fig, ax = plt.subplots(figsize=(5,5)); ax.plot(0, 0, 'r+', markersize=20); ax.axhline(0, color='red', alpha=0.3); ax.axvline(0, color='red', alpha=0.3)
+            # オリジナルプレビュー
+            fig, ax = plt.subplots(figsize=(5,5))
+            ax.plot(0, 0, 'r+', markersize=20)
+            ax.axhline(0, color='red', alpha=0.3); ax.axvline(0, color='red', alpha=0.3)
             for i, p in enumerate(polys_moved):
                 ax.plot(*p.exterior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
                 for interior in p.interiors: ax.plot(*interior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
             ax.axis('equal'); ax.grid(True, linestyle=':'); st.pyplot(fig)
+            
         with c2:
+            # パス生成・計算
             gc_v, gc_p, gc_c, gc_d = None, None, None, None; v_d, p_r_d, p_f_d, c_d = [], [], [], []
             if gfc and not gfc.is_empty:
                 if enable_v:
@@ -465,13 +470,19 @@ if f:
                     if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp["format"])
                 if enable_d:
                     dpts = find_drill_points(gfc, ddt); gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
-            fig2, ax2 = plt.subplots(figsize=(5,5)); ax2.plot(0, 0, 'r+')
+
+            # パス生成結果プレビュー（グリッド設定をaxと同等に）
+            fig2, ax2 = plt.subplots(figsize=(5,5))
+            ax2.plot(0, 0, 'r+', markersize=20)
+            ax2.axhline(0, color='red', alpha=0.3); ax2.axvline(0, color='red', alpha=0.3)
             for p in polys_moved: ax2.plot(*p.exterior.xy, 'k--', alpha=0.05)
             for ls in p_r_d: ax2.plot(*ls.xy, color='tab:blue', alpha=0.3)
             for ls in p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
-            ax2.axis('equal'); st.pyplot(fig2); col1, col2 = st.columns(2)
+            ax2.axis('equal'); ax2.grid(True, linestyle=':'); st.pyplot(fig2)
+            
+            col1, col2 = st.columns(2)
             if gc_v: col1.download_button("VCARVE 保存", gc_v, f"{bn}_vcarve.nc")
             if gc_p: col2.download_button("POCKET 保存", gc_p, f"{bn}_pocket.nc")
             if gc_c: col1.download_button("CHAMFER 保存", gc_c, f"{bn}_chamfer.nc")
