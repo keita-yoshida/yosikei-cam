@@ -116,8 +116,10 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
                     dist_t = r / math.sin(max(0.1, half_rad))
                     center = p_curr + bisector * (dist_t - r + (r * 0.05))
                     dogbone_circles.append(Point(center).buffer(r, resolution=16))
-    try: return unary_union([polygon] + dogbone_circles).simplify(0.001)
-    except: return polygon
+    try:
+        return unary_union([polygon] + dogbone_circles).simplify(0.001)
+    except:
+        return polygon
 
 def apply_dogbone(geometry, tool_dia):
     polys = ensure_list_of_polys(geometry)
@@ -139,7 +141,8 @@ def dxf_to_shapely_list(dxf_bytes):
                     else:
                         p_obj = ezdxf.path.make_path(e); pts = list(p_obj.flattening(0.01))
                         poly = Polygon([(v.x, v.y) for v in pts]) if len(pts) > 2 else None
-                    if poly and poly.is_valid and poly.area > 0.0001: polys.append(poly)
+                    if poly and poly.is_valid and poly.area > 0.0001:
+                        polys.append(poly)
                     elif poly:
                         clean = make_valid(poly)
                         if clean.area > 0.0001:
@@ -167,10 +170,12 @@ def analyze_holes(geometry):
         return w
     for p in polys:
         d = check_p(p)
-        if d: sizes.append(round(d, 2))
+        if d:
+            sizes.append(round(d, 2))
         for interior in p.interiors:
-            d = check_p(Polygon(interior))
-            if d: sizes.append(round(d, 2))
+            d_hole = check_p(Polygon(interior))
+            if d_hole:
+                sizes.append(round(d_hole, 2))
     return Counter(sizes)
 
 # --- 3. 加工パス生成 ---
@@ -187,9 +192,9 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         if pt:
             drill_points.append(pt)
         for interior in p.interiors:
-            pt = check_p(Polygon(interior))
-            if pt:
-                drill_points.append(pt)
+            pt_hole = check_p(Polygon(interior))
+            if pt_hole:
+                drill_points.append(pt_hole)
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -237,7 +242,7 @@ def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0
     except: pass
     return ([LineString(ls.coords) for ls in rough_paths], [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ グラフ理論ロジック ---
+# --- Vカーブ ロジック ---
 
 class PathGraph:
     def __init__(self): self.adj = {}
@@ -273,7 +278,7 @@ class PathGraph:
                 if len(chain) > 1: chains.append(chain)
         return chains
 
-def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
+def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offset=0.0):
     polys = ensure_list_of_polys(geometry)
     if not polys:
         return []
@@ -297,7 +302,8 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1):
         path_3d = []; ls = LineString(chain); pts_count = max(2, int(ls.length / step_len) + 1)
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1))
-            d = pt.distance(boundary); z = -(d / tan_a)
+            d = pt.distance(boundary); z = -(d / tan_a) + z_offset
+            if z > 0: z = 0
             if use_limit and z < max_d: z = max_d
             path_3d.append((pt.x, pt.y, z))
         if len(path_3d) > 1: all_paths.append(douglas_peucker(path_3d, 0.02))
@@ -332,8 +338,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 2.7")
-st.caption("Ver 2.7: インデント・文法エラー完全修正版")
+st.title("⚡ yosikeiCAM 2.8")
+st.caption("Ver 2.8: ポケット・Vカーブ 2回加工設定 & 面積表示復活版")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -344,22 +350,21 @@ with st.sidebar:
     with tab1:
         enable_p = st.checkbox("有効", value=True, key="cp")
         dia = st.number_input("工具径 (mm)", value=3.0, step=0.1)
-        clear = st.number_input("仕上げ代 (mm)", value=0.0, step=0.1)
-        c1, c2 = st.columns(2)
-        with c1: dep_p = st.number_input("最終深さ Z", value=-1.0, step=0.1)
-        with c2: stp_p = st.number_input("切込ピッチ", value=1.0, min_value=0.01)
-        use_dogbone = st.checkbox("ドッグボーン (角逃げ)", value=True)
-        st.caption("▼ 送り速度設定")
-        fed_p_rough = st.number_input("粗送り速度", value=300, min_value=1, step=50, key="fp_r")
+        ucp = st.checkbox("2回加工 (粗+仕上げ)", value=False, key="uccp")
+        clear = 0.0
+        fed_p_rough = st.number_input("送り速度 (通常/粗)", value=300, min_value=1, key="fp_r")
         fed_p_finish = fed_p_rough; finish_mode = "Step-down"
-        if clear > 0:
-            st.markdown("---")
-            st.caption("▼ 仕上げ詳細設定")
+        if ucp:
+            clear = st.number_input("仕上げ代 (mm)", value=0.2, step=0.1)
             c3, c4 = st.columns(2)
             with c3: fed_p_finish = st.number_input("仕上げ送り", value=300, min_value=1, key="fp_f")
             with c4: 
                 f_opt = st.radio("仕上げ深さ", ["ピッチ刻み", "最終一括"], index=0, key="f_m_p")
                 finish_mode = "Full-Depth" if f_opt == "最終一括" else "Step-down"
+        c1, c2 = st.columns(2)
+        with c1: dep_p = st.number_input("最終深さ Z", value=-1.0, step=0.1)
+        with c2: stp_p = st.number_input("切込ピッチ", value=1.0, min_value=0.01)
+        use_dogbone = st.checkbox("ドッグボーン (角逃げ)", value=True)
     
     with tab2:
         enable_c = st.checkbox("有効", value=True, key="cc")
@@ -367,7 +372,7 @@ with st.sidebar:
         to = st.number_input("刃先オフセット", value=1.0, step=0.1)
         z_c = -(cw + to)
         st.caption(f"切込深さ: {z_c:.2f}mm")
-        fed_c_rough = st.number_input("粗送り速度", value=300, min_value=1, step=50, key="fc_r")
+        fed_c_rough = st.number_input("粗送り速度", value=300, min_value=1, key="fc_r")
         ucf = st.checkbox("2回加工 (粗+仕上げ)", value=False, key="uccf")
         cfa = 0.0; fed_c_finish = fed_c_rough
         if ucf:
@@ -378,14 +383,19 @@ with st.sidebar:
     with tab3:
         enable_v = st.checkbox("有効", value=False, key="cv")
         va = st.number_input("角度 (度)", value=60.0, step=10.0)
+        ucv = st.checkbox("2回加工 (粗+仕上げ)", value=False, key="uccv")
+        v_clear = 0.0; fed_v_f = 300
+        fed_v = st.number_input("送り速度 (通常/粗)", value=300, min_value=1, key="fv")
+        if ucv:
+            v_clear = st.number_input("仕上げ代 (Zオフセット mm)", value=0.2, step=0.1, help="1回目はこれだけ浅く彫ります")
+            fed_v_f = st.number_input("仕上げ送り", value=300, min_value=1, key="fv_f")
         uvl = st.checkbox("深さ制限", value=False); vl = st.number_input("最大深さ (mm)", value=-3.0) if uvl else -100.0
-        fed_v = st.number_input("速度", value=300, min_value=1, key="fv")
-        vr = st.slider("精度", value=0.05, min_value=0.02, max_value=0.2)
+        vr = st.slider("計算精度", value=0.05, min_value=0.02, max_value=0.2)
         
     with tab4:
         enable_d = st.checkbox("有効", value=False, key="cd")
         ddt = st.number_input("対象径 (mm)", value=3.0); ddz = st.number_input("深さ Z", value=-5.0)
-        pck = st.number_input("ペック量", value=2.0, min_value=0.1); fed_d = st.number_input("送り", value=200, key="fd")
+        pck = st.number_input("ペック量", value=2.0, min_value=0.1); fd = st.number_input("送り", value=200, key="fd")
         
     st.divider(); ppn = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys()))
     pp = POST_PROCESSORS[ppn]; h_c = st.text_area("Header", pp["start"]); f_c = st.text_area("Footer", pp["end"])
@@ -427,21 +437,31 @@ if f:
             v_d, p_r_d, p_f_d, c_d = [], [], [], []
             if gfc and not gfc.is_empty:
                 if enable_v:
-                    with st.spinner("VCarve..."): v_d = generate_vcarve(gfc, va, uvl, vl, vr)
-                    if v_d: gc_v = make_gcode_phases_advanced([{'name':'V-Carve','paths':v_d,'z_start':0,'z_final':0,'feed':fed_v}], "VBit", h_c, f_c, pp["format"], True)
+                    with st.spinner("VCarve..."):
+                        v_r_paths = []
+                        if ucv: v_r_paths = generate_vcarve(gfc, va, uvl, vl, vr, z_offset=v_clear)
+                        v_f_paths = generate_vcarve(gfc, va, uvl, vl, vr, z_offset=0.0)
+                        v_d = v_r_paths + v_f_paths
+                        phs_v = []
+                        if v_r_paths: phs_v.append({'name':'V-Rough','paths':v_r_paths,'z_start':0,'z_final':0,'feed':fed_v})
+                        if v_f_paths: phs_v.append({'name':'V-Finish','paths':v_f_paths,'z_start':0,'z_final':0,'feed':fed_v_f if ucv else fed_v})
+                        if phs_v: gc_v = make_gcode_phases_advanced(phs_v, "VBit", h_c, f_c, pp["format"], True)
+                
                 if enable_p:
-                    p_r, p_f = generate_pocket(gfc, dia, clear, 0.5, use_dogbone); p_r_d, p_f_d = p_r, p_f; phs = []
+                    p_r, p_f = generate_pocket(gfc, dia, clear if ucp else 0.0, 0.5, use_dogbone); p_r_d, p_f_d = p_r, p_f; phs = []
                     if p_r: phs.append({'name':'Rough','paths':p_r,'z_start':0,'z_final':dep_p,'feed':fed_p_rough,'z_step':stp_p})
-                    if p_f: phs.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':fed_p_finish,'z_step':(abs(dep_p) if finish_mode=="Full-Depth" else stp_p)})
+                    if p_f and ucp: phs.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':fed_p_finish,'z_step':(abs(dep_p) if finish_mode=="Full-Depth" else stp_p)})
                     if phs: gc_p = make_gcode_phases_advanced(phs, "EndMill", h_c, f_c, pp["format"])
+                
                 if enable_c:
                     rp, fp = generate_chamfer_separated(gfc, cw, to, cfa if ucf else 0.0); c_d = rp + fp; phs = []
-                    if rp: phs.append({'name':'Rough','paths':rp,'z_start':0,'z_final':z_c,'feed':fed_c_rough})
-                    if fp: phs.append({'name':'Finish','paths':fp,'z_start':0,'z_final':z_c,'feed':fed_c_finish})
+                    if rp and ucf: phs.append({'name':'Rough','paths':rp,'z_start':0,'z_final':z_c,'feed':fed_c_rough})
+                    if fp: phs.append({'name':'Finish','paths':fp,'z_start':0,'z_final':z_c,'feed':fed_c_finish if ucf else fed_c_rough})
                     if phs: gc_c = make_gcode_phases_advanced(phs, "Chamfer", h_c, f_c, pp["format"])
+                
                 if enable_d:
                     dpts = find_drill_points(gfc, ddt)
-                    if dpts: gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fed_d, f"Drill {ddt}mm", h_c, f_c, pp["format"])
+                    if dpts: gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
 
             fig2, ax2 = plt.subplots(figsize=(5,5)); ax2.plot(0, 0, 'r+')
             for p in polys_moved: ax2.plot(*p.exterior.xy, 'k--', alpha=0.05)
