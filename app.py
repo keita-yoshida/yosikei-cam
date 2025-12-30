@@ -85,37 +85,62 @@ def douglas_peucker(points, tolerance):
         return [points[0], points[end]]
 
 def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
-    if polygon.is_empty: return polygon
+    """改良版ドッグボーン: 内角を解析して確実に逃げを作成"""
+    if polygon.is_empty:
+        return polygon
     poly = polygon.simplify(0.001)
-    if poly.geom_type != 'Polygon': return polygon
+    if poly.geom_type != 'Polygon':
+        return polygon
+        
     rings = [poly.exterior] + list(poly.interiors)
     dogbone_circles = []
     r = tool_dia / 2.0
-    for ring in rings:
+    
+    for ring_idx, ring in enumerate(rings):
         coords = list(ring.coords)
-        if coords[0] == coords[-1]: coords.pop()
+        if coords[0] == coords[-1]:
+            coords.pop()
         num_pts = len(coords)
+        
         for i in range(num_pts):
+            p_prev = np.array(coords[(i - 1) % num_pts])
             p_curr = np.array(coords[i])
-            p_prev = np.array(coords[(i-1)%num_pts])
-            p_next = np.array(coords[(i+1)%num_pts])
-            v1, v2 = p_curr - p_prev, p_next - p_curr
-            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if n1 < 1e-6 or n2 < 1e-6: continue
-            v1 /= n1; v2 /= n2
-            cross = np.cross(v1, v2); dot = np.dot(v1, v2)
-            angle_deg = math.degrees(math.atan2(cross, dot))
-            if 5 < abs(angle_deg) < 175:
+            p_next = np.array(coords[(i + 1) % num_pts])
+            
+            v1 = p_curr - p_prev
+            v2 = p_next - p_curr
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+                
+            v1 /= n1
+            v2 /= n2
+            
+            # 外積で回転方向を判定
+            cross_z = v1[0] * v2[1] - v1[1] * v2[0]
+            
+            # ポケットの「内角」が鋭角（工具が入れない）か判定
+            # 外枠(exterior)は反時計回り、穴(interior)は時計回りがShapely標準
+            is_internal_corner = False
+            if ring_idx == 0: # Exterior
+                if cross_z > 0.05: is_internal_corner = True # 左折は内角
+            else: # Interior
+                if cross_z < -0.05: is_internal_corner = True # 右折は内角
+            
+            if is_internal_corner:
+                # 角を工具の半径分だけ「掘り進める」ベクトルを計算
                 bisector = v2 - v1
                 bn = np.linalg.norm(bisector)
                 if bn > 1e-6:
                     bisector /= bn
-                    test_pt = p_curr + bisector * 0.01
-                    if not poly.contains(Point(test_pt)): bisector = -bisector
-                    half_rad = math.radians((180 - abs(angle_deg)) / 2)
-                    dist_t = r / math.sin(max(0.1, half_rad))
-                    center = p_curr + bisector * (dist_t - r + (r * 0.05))
+                    # 工具の中心を「頂点からrの位置」に置けば、刃の端が頂点に届く
+                    # 少しだけ深く(1.05倍)設定して確実に角を出す
+                    center = p_curr + bisector * (r * 1.05)
                     dogbone_circles.append(Point(center).buffer(r, resolution=16))
+                    
+    if not dogbone_circles:
+        return polygon
     try:
         return unary_union([polygon] + dogbone_circles).simplify(0.001)
     except:
@@ -123,50 +148,69 @@ def apply_dogbone_single(polygon: Polygon, tool_dia: float) -> Polygon:
 
 def apply_dogbone(geometry, tool_dia):
     polys = ensure_list_of_polys(geometry)
-    if not polys: return geometry
+    if not polys:
+        return geometry
     return unary_union([apply_dogbone_single(p, tool_dia) for p in polys])
 
 # --- 2. データ読み込み ---
 
 def dxf_to_shapely_list(dxf_bytes):
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
-        tmp.write(dxf_bytes); tmp_path = tmp.name
+        tmp.write(dxf_bytes)
+        tmp_path = tmp.name
     try:
-        doc = ezdxf.readfile(tmp_path); msp = doc.modelspace(); polys = []
+        doc = ezdxf.readfile(tmp_path)
+        msp = doc.modelspace()
+        polys = []
         for e in msp:
             if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE', 'CIRCLE'):
                 try:
                     if e.dxftype() == 'CIRCLE':
                         poly = Point(e.dxf.center[:2]).buffer(e.dxf.radius, resolution=64)
                     else:
-                        p_obj = ezdxf.path.make_path(e); pts = list(p_obj.flattening(0.01))
+                        p_obj = ezdxf.path.make_path(e)
+                        pts = list(p_obj.flattening(0.01))
                         poly = Polygon([(v.x, v.y) for v in pts]) if len(pts) > 2 else None
                     if poly and poly.is_valid and poly.area > 0.0001:
                         polys.append(poly)
                     elif poly:
                         clean = make_valid(poly)
                         if clean.area > 0.0001:
-                            if clean.geom_type == 'Polygon': polys.append(clean)
-                            else: polys.extend(clean.geoms)
-                except: pass
-        polys.sort(key=lambda x: x.area, reverse=True); return polys
-    except Exception as e: st.error(f"DXF Read Error: {e}"); return []
+                            if clean.geom_type == 'Polygon':
+                                polys.append(clean)
+                            else:
+                                polys.extend(clean.geoms)
+                except:
+                    pass
+        polys.sort(key=lambda x: x.area, reverse=True)
+        return polys
+    except Exception as e:
+        st.error(f"DXF Read Error: {e}")
+        return []
     finally:
-        if os.path.exists(tmp_path): os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def merge_polygons_xor(polys):
-    if not polys: return None
+    if not polys:
+        return None
     combined = Polygon()
     for p in polys:
-        combined = combined.symmetric_difference(p) if not combined.is_empty else p
+        if combined.is_empty:
+            combined = p
+        else:
+            combined = combined.symmetric_difference(p)
     return combined
 
 def analyze_holes(geometry):
-    polys = ensure_list_of_polys(geometry); sizes = []
+    polys = ensure_list_of_polys(geometry)
+    sizes = []
     def check_p(p):
-        minx, miny, maxx, maxy = p.bounds; w, h = maxx - minx, maxy - miny
+        minx, miny, maxx, maxy = p.bounds
+        w, h = maxx - minx, maxy - miny
         if abs(w - h) > 0.1: return None
-        if abs(p.area - math.pi * ((w/2)**2)) / (math.pi * ((w/2)**2)) > 0.2: return None
+        expected_area = math.pi * ((w/2)**2)
+        if abs(p.area - expected_area) / expected_area > 0.2: return None
         return w
     for p in polys:
         d = check_p(p)
@@ -181,9 +225,11 @@ def analyze_holes(geometry):
 # --- 3. 加工パス生成 ---
 
 def find_drill_points(geometry, target_dia, tolerance=0.1):
-    polys = ensure_list_of_polys(geometry); drill_points = []
+    polys = ensure_list_of_polys(geometry)
+    drill_points = []
     def check_p(p):
-        minx, miny, maxx, maxy = p.bounds; w, h = maxx - minx, maxy - miny
+        minx, miny, maxx, maxy = p.bounds
+        w, h = maxx - minx, maxy - miny
         if abs(w - h) > tolerance: return None
         if not (target_dia - tolerance <= w <= target_dia + tolerance): return None
         return p.centroid
@@ -200,58 +246,102 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
     if not points: return None
     gc = [header.strip(), f"; Tool: {tool_name} (Drill)", "T1 M06", f"F{int(feed)}", ""]
-    G0 = "G0" if "G0/" in fmt else "G00"; G1 = "G1" if "G0/" in fmt else "G01"; safe = 5.0
+    G0 = "G0" if "G0/" in fmt else "G00"
+    G1 = "G1" if "G0/" in fmt else "G01"
+    safe = 5.0
     for pt in points:
-        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}\n{G0} X{pt.x:.3f} Y{pt.y:.3f}\n{G0} Z{z_start + 1.0}")
+        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}")
+        gc.append(f"{G0} X{pt.x:.3f} Y{pt.y:.3f}")
+        gc.append(f"{G0} Z{z_start + 1.0}")
         current_z = z_start
         while current_z > z_final:
-            target_z = max(current_z - peck_depth, z_final); gc.append(f"{G1} Z{target_z:.3f}")
-            if target_z > z_final: gc.append(f"{G0} Z{z_start + 0.5}\n{G0} Z{target_z + 0.5}")
+            target_z = max(current_z - peck_depth, z_final)
+            gc.append(f"{G1} Z{target_z:.3f}")
+            if target_z > z_final:
+                gc.append(f"{G0} Z{z_start + 0.5}")
+                gc.append(f"{G0} Z{target_z + 0.5}")
             current_z = target_z
         gc.append(f"{G0} Z{safe}")
-    gc.append(footer.strip()); return "\n".join(gc)
+    gc.append(footer.strip())
+    return "\n".join(gc)
 
 def generate_pocket(geometry, tool_d, clearance, stepover, dogbone):
-    paths_rough = []; paths_finish = []; r = tool_d / 2.0; step = tool_d * stepover; offset_rough = -(r + clearance)
-    try: current_rough = geometry.buffer(offset_rough, join_style=2)
-    except: current_rough = Polygon()
+    paths_rough = []
+    paths_finish = []
+    r = tool_d / 2.0
+    step = tool_d * stepover
+    
+    # 荒取り用ジオメトリ
+    offset_rough = -(r + clearance)
+    try:
+        current_rough = geometry.buffer(offset_rough, join_style=2)
+    except:
+        current_rough = Polygon()
+        
     while not current_rough.is_empty and current_rough.area > 0.01:
         current_polys = ensure_list_of_polys(current_rough)
-        for p in current_polys: paths_rough.append(p.exterior); paths_rough.extend(p.interiors)
-        try: current_rough = current_rough.buffer(-step, join_style=2)
-        except: break
-    if clearance > 0:
-        work_geom_finish = geometry
-        if dogbone: work_geom_finish = apply_dogbone(geometry, tool_d)
+        for p in current_polys:
+            paths_rough.append(p.exterior)
+            paths_rough.extend(p.interiors)
         try:
-            finish_pass = work_geom_finish.buffer(-r, join_style=2); finish_polys = ensure_list_of_polys(finish_pass)
-            for p in finish_polys: paths_finish.append(p.exterior); paths_finish.extend(p.interiors)
-        except: pass
-    return ([LineString(p.coords) for p in paths_rough if p.length > 0.1], [LineString(p.coords) for p in paths_finish if p.length > 0.1])
+            current_rough = current_rough.buffer(-step, join_style=2)
+        except:
+            break
+            
+    # 仕上げ用ジオメトリ（ドッグボーン適用）
+    work_geom_finish = geometry
+    if dogbone:
+        work_geom_finish = apply_dogbone(geometry, tool_d)
+    
+    try:
+        finish_pass = work_geom_finish.buffer(-r, join_style=2)
+        finish_polys = ensure_list_of_polys(finish_pass)
+        for p in finish_polys:
+            paths_finish.append(p.exterior)
+            paths_finish.extend(p.interiors)
+    except:
+        pass
+            
+    return ([LineString(p.coords) for p in paths_rough if p.length > 0.1], 
+            [LineString(p.coords) for p in paths_finish if p.length > 0.1])
 
 def generate_chamfer_separated(geometry, width, tip_offset, finish_allowance=0.0):
-    rough_paths = []; finish_paths = []
+    rough_paths = []
+    finish_paths = []
     if finish_allowance > 0:
         try:
-            p_rough = geometry.buffer(tip_offset + finish_allowance, join_style=1); p_list = ensure_list_of_polys(p_rough)
-            for poly in p_list: rough_paths.append(poly.exterior); rough_paths.extend(poly.interiors)
-        except: pass
+            p_rough = geometry.buffer(tip_offset + finish_allowance, join_style=1)
+            p_list = ensure_list_of_polys(p_rough)
+            for poly in p_list:
+                rough_paths.append(poly.exterior)
+                rough_paths.extend(poly.interiors)
+        except:
+            pass
     try:
-        p_finish = geometry.buffer(tip_offset, join_style=1); p_list_finish = ensure_list_of_polys(p_finish)
-        for poly in p_list_finish: finish_paths.append(poly.exterior); finish_paths.extend(poly.interiors)
-    except: pass
-    return ([LineString(ls.coords) for ls in rough_paths], [LineString(ls.coords) for ls in finish_paths])
+        p_finish = geometry.buffer(tip_offset, join_style=1)
+        p_list_finish = ensure_list_of_polys(p_finish)
+        for poly in p_list_finish:
+            finish_paths.append(poly.exterior)
+            finish_paths.extend(poly.interiors)
+    except:
+        pass
+    return ([LineString(ls.coords) for ls in rough_paths], 
+            [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ ロジック ---
+# --- Vカーブ グラフ理論ロジック ---
 
 class PathGraph:
-    def __init__(self): self.adj = {}
+    def __init__(self):
+        self.adj = {}
+        
     def add_edge(self, p1, p2):
         p1, p2 = (round(p1[0], 3), round(p1[1], 3)), (round(p2[0], 3), round(p2[1], 3))
         if p1 == p2: return
         if p1 not in self.adj: self.adj[p1] = set()
         if p2 not in self.adj: self.adj[p2] = set()
-        self.adj[p1].add(p2); self.adj[p2].add(p1)
+        self.adj[p1].add(p2)
+        self.adj[p2].add(p1)
+
     def prune(self, min_len=4.0):
         for _ in range(10):
             leaves = [n for n, neigh in self.adj.items() if len(neigh) == 1]
@@ -260,21 +350,31 @@ class PathGraph:
                 if leaf not in self.adj: continue
                 neighbor = list(self.adj[leaf])[0]
                 if math.sqrt((leaf[0]-neighbor[0])**2 + (leaf[1]-neighbor[1])**2) < min_len and len(self.adj[neighbor]) > 2:
-                    self.adj[neighbor].remove(leaf); del self.adj[leaf]
+                    self.adj[neighbor].remove(leaf)
+                    del self.adj[leaf]
+
     def get_chains(self):
-        chains = []; visited = set(); nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n])%2!=1, -len(self.adj[n])))
+        chains = []
+        visited = set()
+        nodes = sorted(self.adj.keys(), key=lambda n: (len(self.adj[n])%2!=1, -len(self.adj[n])))
         for start in nodes:
             if start not in self.adj: continue
             for neighbor in list(self.adj[start]):
                 edge = tuple(sorted((start, neighbor)))
                 if edge in visited: continue
-                chain = [start, neighbor]; visited.add(edge); curr = neighbor
+                chain = [start, neighbor]
+                visited.add(edge)
+                curr = neighbor
                 while True:
                     cands = [n for n in self.adj[curr] if tuple(sorted((curr, n))) not in visited]
                     if len(cands) == 1:
-                        nxt = cands[0]; visited.add(tuple(sorted((curr, nxt)))); chain.append(nxt); curr = nxt
+                        nxt = cands[0]
+                        visited.add(tuple(sorted((curr, nxt))))
+                        chain.append(nxt)
+                        curr = nxt
                         if len(self.adj[curr]) > 2: break
-                    else: break
+                    else:
+                        break
                 if len(chain) > 1: chains.append(chain)
         return chains
 
@@ -282,27 +382,40 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offse
     polys = ensure_list_of_polys(geometry)
     if not polys:
         return []
-    tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
-    combined_geom = unary_union(polys); boundary = combined_geom.boundary 
+    tan_a = np.tan(np.radians(angle_deg/2))
+    graph = PathGraph()
+    combined_geom = unary_union(polys)
+    boundary = combined_geom.boundary # 全壁面
+    
     for poly in polys:
-        smooth = poly.simplify(0.02, preserve_topology=True); line = smooth.exterior; sample_res = 0.2
+        smooth = poly.simplify(0.02, preserve_topology=True)
+        line = smooth.exterior
+        sample_res = 0.2
         num = max(50, min(8000, int(line.length / sample_res)))
         pts = [line.interpolate(i * line.length / (num-1)) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
-        try: vor = Voronoi(coords)
-        except: continue
+        try:
+            vor = Voronoi(coords)
+        except:
+            continue
         for (p1_idx, p2_idx), (v1_idx, v2_idx) in zip(vor.ridge_points, vor.ridge_vertices):
             if v1_idx < 0 or v2_idx < 0: continue
             v1, v2 = vor.vertices[v1_idx], vor.vertices[v2_idx]
             if combined_geom.contains(Point(v1)) and combined_geom.contains(Point(v2)):
                 if np.linalg.norm(vor.points[p1_idx] - vor.points[p2_idx]) > sample_res * 5.0:
                     graph.add_edge(v1, v2)
-    graph.prune(min_len=4.0); chains = graph.get_chains(); all_paths = []
+    
+    graph.prune(min_len=4.0)
+    chains = graph.get_chains()
+    all_paths = []
     for chain in chains:
-        path_3d = []; ls = LineString(chain); pts_count = max(2, int(ls.length / step_len) + 1)
+        path_3d = []
+        ls = LineString(chain)
+        pts_count = max(2, int(ls.length / step_len) + 1)
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1))
-            d = pt.distance(boundary); z = -(d / tan_a) + z_offset
+            d = pt.distance(boundary)
+            z = -(d / tan_a) + z_offset
             if z > 0: z = 0
             if use_limit and z < max_d: z = max_d
             path_3d.append((pt.x, pt.y, z))
@@ -312,16 +425,29 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offse
 # --- 4. Gコードエンジン ---
 
 def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01", is_3d=False):
-    gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06"]; G0 = "G0" if "G0/" in fmt else "G00"; G1 = "G1" if "G0/" in fmt else "G01"; safe = 5.0; gc.append(f"{G0} Z{safe}")
+    gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06"]
+    G0 = "G0" if "G0/" in fmt else "G00"
+    G1 = "G1" if "G0/" in fmt else "G01"
+    safe = 5.0
+    gc.append(f"{G0} Z{safe}")
+    
     for i, phase in enumerate(phases):
         paths = phase.get('paths', [])
         if not paths: continue
-        feed = int(phase.get('feed', 300)); z_start = phase.get('z_start', 0); z_final = phase.get('z_final', 0); z_step = max(0.01, phase.get('z_step', abs(z_final - z_start)))
-        gc.append(f"; Phase {i+1}: {phase.get('name','')} (F{feed})"); gc.append(f"F{feed}")
+        feed = int(phase.get('feed', 300))
+        z_start = phase.get('z_start', 0)
+        z_final = phase.get('z_final', 0)
+        z_step = max(0.01, phase.get('z_step', abs(z_final - z_start)))
+        
+        gc.append(f"; Phase {i+1}: {phase.get('name','')} (F{feed})")
+        gc.append(f"F{feed}")
+        
         if is_3d:
             for p_pts in paths:
-                gc.append(f"{G0} X{p_pts[0][0]:.3f} Y{p_pts[0][1]:.3f}\n{G1} Z{p_pts[0][2]:.3f}")
-                for p in p_pts[1:]: gc.append(f"{G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
+                gc.append(f"{G0} X{p_pts[0][0]:.3f} Y{p_pts[0][1]:.3f}")
+                gc.append(f"{G1} Z{p_pts[0][2]:.3f}")
+                for p in p_pts[1:]:
+                    gc.append(f"{G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
                 gc.append(f"{G0} Z{safe}")
         else:
             cur_z = z_start
@@ -329,17 +455,21 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
                 tgt_z = max(cur_z - z_step, z_final)
                 for path in paths:
                     coords = np.array(path.coords)
-                    gc.append(f"{G0} X{coords[0,0]:.3f} Y{coords[0,1]:.3f}\n{G0} Z{cur_z + 1.0}\n{G1} Z{tgt_z:.3f}")
-                    for xy in coords[1:]: gc.append(f"{G1} X{xy[0]:.3f} Y{xy[1]:.3f}")
+                    gc.append(f"{G0} X{coords[0,0]:.3f} Y{coords[0,1]:.3f}")
+                    gc.append(f"{G0} Z{cur_z + 1.0}")
+                    gc.append(f"{G1} Z{tgt_z:.3f}")
+                    for xy in coords[1:]:
+                        gc.append(f"{G1} X{xy[0]:.3f} Y{xy[1]:.3f}")
                     gc.append(f"{G0} Z{safe}")
                 cur_z = tgt_z
-    gc.append(footer.strip()); return "\n".join(gc)
+    gc.append(footer.strip())
+    return "\n".join(gc)
 
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 2.8")
-st.caption("Ver 2.8: ポケット・Vカーブ 2回加工設定 & 面積表示復活版")
+st.title("⚡ yosikeiCAM 2.9")
+st.caption("Ver 2.9: 改良型ドッグボーン & 2回加工オプション完全実装")
 
 with st.sidebar:
     st.header("📍 原点設定")
@@ -372,7 +502,7 @@ with st.sidebar:
         to = st.number_input("刃先オフセット", value=1.0, step=0.1)
         z_c = -(cw + to)
         st.caption(f"切込深さ: {z_c:.2f}mm")
-        fed_c_rough = st.number_input("粗送り速度", value=300, min_value=1, key="fc_r")
+        fed_c_rough = st.number_input("粗送り速度", value=300, min_value=1, step=50, key="fc_r")
         ucf = st.checkbox("2回加工 (粗+仕上げ)", value=False, key="uccf")
         cfa = 0.0; fed_c_finish = fed_c_rough
         if ucf:
@@ -461,12 +591,12 @@ if f:
                 
                 if enable_d:
                     dpts = find_drill_points(gfc, ddt)
-                    if dpts: gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
+                    if dpts: gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fed_d, f"Drill {ddt}mm", h_c, f_c, pp["format"])
 
             fig2, ax2 = plt.subplots(figsize=(5,5)); ax2.plot(0, 0, 'r+')
             for p in polys_moved: ax2.plot(*p.exterior.xy, 'k--', alpha=0.05)
             for ls in p_r_d: ax2.plot(*ls.xy, color='tab:blue', alpha=0.3)
-            for ls in p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
+            for ls in p_f_disp_r := p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
             ax2.axis('equal'); st.pyplot(fig2); col1, col2 = st.columns(2)
