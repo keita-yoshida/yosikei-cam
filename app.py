@@ -101,7 +101,8 @@ def dxf_to_shapely_list(dxf_bytes):
                         poly = Point(e.dxf.center[:2]).buffer(e.dxf.radius, resolution=64)
                     else:
                         p_obj = ezdxf.path.make_path(e)
-                        pts = list(p_obj.flattening(0.01))
+                        # 読み込み精度を向上させるため 0.005 に設定
+                        pts = list(p_obj.flattening(0.005))
                         poly = Polygon([(v.x, v.y) for v in pts]) if len(pts) > 2 else None
                     if poly and poly.is_valid and poly.area > 0.0001:
                         polys.append(poly)
@@ -244,7 +245,7 @@ def generate_chamfer_separated(geometry, tip_offset, finish_allowance=0.0):
     return ([LineString(ls.coords) for ls in rough_paths], 
             [LineString(ls.coords) for ls in finish_paths])
 
-# --- Vカーブ グラフ理論ロジック ---
+# --- Vカーブ ロジック (精度向上版) ---
 
 class PathGraph:
     def __init__(self):
@@ -255,7 +256,7 @@ class PathGraph:
         if p1 not in self.adj: self.adj[p1] = set()
         if p2 not in self.adj: self.adj[p2] = set()
         self.adj[p1].add(p2); self.adj[p2].add(p1)
-    def prune(self, min_len=4.0):
+    def prune(self, min_len=1.5): # フィルタを昨日までと同等の 1.5 に緩和
         for _ in range(10):
             leaves = [n for n, neigh in self.adj.items() if len(neigh) == 1]
             if not leaves: break
@@ -283,26 +284,38 @@ class PathGraph:
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offset=0.0):
     polys = ensure_list_of_polys(geometry)
-    if not polys: return []
-    tan_a = np.tan(np.radians(angle_deg/2)); graph = PathGraph()
-    combined_geom = unary_union(polys); boundary = combined_geom.boundary 
+    if not polys:
+        return []
+    tan_a = np.tan(np.radians(angle_deg/2))
+    graph = PathGraph()
+    combined_geom = unary_union(polys)
+    boundary = combined_geom.boundary 
     for poly in polys:
-        smooth = poly.simplify(0.02, preserve_topology=True)
-        line = smooth.exterior; sample_res = 0.2
-        num = max(50, min(8000, int(line.length / sample_res)))
+        # 簡略化を最小限（0.005）に抑えて形状精度を確保
+        smooth = poly.simplify(0.005, preserve_topology=True)
+        line = smooth.exterior
+        # サンプリング密度を 0.1 に向上
+        sample_res = 0.1
+        num = max(100, min(12000, int(line.length / sample_res)))
         pts = [line.interpolate(i * line.length / (num-1)) for i in range(num)]
         coords = np.array([(p.x, p.y) for p in pts])
-        try: vor = Voronoi(coords)
-        except: continue
+        try:
+            vor = Voronoi(coords)
+        except:
+            continue
         for (p1_idx, p2_idx), (v1_idx, v2_idx) in zip(vor.ridge_points, vor.ridge_vertices):
             if v1_idx < 0 or v2_idx < 0: continue
             v1, v2 = vor.vertices[v1_idx], vor.vertices[v2_idx]
             if combined_geom.contains(Point(v1)) and combined_geom.contains(Point(v2)):
-                if np.linalg.norm(vor.points[p1_idx] - vor.points[p2_idx]) > sample_res * 5.0:
+                if np.linalg.norm(vor.points[p1_idx] - vor.points[p2_idx]) > sample_res * 3.0:
                     graph.add_edge(v1, v2)
-    graph.prune(min_len=4.0); chains = graph.get_chains(); all_paths = []
+    
+    graph.prune(min_len=1.5) # 文字の形状を維持するため緩和
+    chains = graph.get_chains()
+    all_paths = []
     for chain in chains:
-        path_3d = []; ls = LineString(chain)
+        path_3d = []
+        ls = LineString(chain)
         pts_count = max(2, int(ls.length / step_len) + 1)
         for i in range(pts_count):
             pt = ls.interpolate(i * ls.length / (pts_count - 1))
@@ -349,8 +362,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("yosikeiCAM 3.7")
-st.caption("Ver 3.7: プレビューグリッド同期版")
+st.title("yosikeiCAM 3.8")
+st.caption("Ver 3.8: Vカーブ高精度復刻版")
 
 with st.sidebar:
     st.header("原点設定")
@@ -432,13 +445,13 @@ if f:
             hs = analyze_holes(gfc)
             if hs: st.sidebar.info("検出された円: " + ", ".join([f"φ{d}({c}個)" for d, c in hs.items()]))
         
-        # 加工サイズとヘッダー
+        # 加工サイズ表示
         st.success(f"加工サイズ: {w_size:.1f} x {h_size:.1f} mm")
         st.header("パス生成")
         
         c1, c2 = st.columns(2)
         with c1:
-            # オリジナルプレビュー
+            # オリジナルプレビュー (グリッドあり)
             fig, ax = plt.subplots(figsize=(5,5))
             ax.plot(0, 0, 'r+', markersize=20)
             ax.axhline(0, color='red', alpha=0.3); ax.axvline(0, color='red', alpha=0.3)
@@ -448,7 +461,7 @@ if f:
             ax.axis('equal'); ax.grid(True, linestyle=':'); st.pyplot(fig)
             
         with c2:
-            # パス生成・計算
+            # パス計算
             gc_v, gc_p, gc_c, gc_d = None, None, None, None; v_d, p_r_d, p_f_d, c_d = [], [], [], []
             if gfc and not gfc.is_empty:
                 if enable_v:
@@ -471,7 +484,7 @@ if f:
                 if enable_d:
                     dpts = find_drill_points(gfc, ddt); gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
 
-            # パス生成結果プレビュー（グリッド設定をaxと同等に）
+            # 生成プレビュー (左側とグリッドを完全に同期)
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=20)
             ax2.axhline(0, color='red', alpha=0.3); ax2.axvline(0, color='red', alpha=0.3)
