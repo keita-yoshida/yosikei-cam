@@ -145,9 +145,9 @@ def analyze_holes(geometry):
         if d:
             sizes.append(round(d, 2))
         for interior in p.interiors:
-            d_hole = check_p(Polygon(interior))
-            if d_hole:
-                sizes.append(round(d_hole, 2))
+            d_h = check_p(Polygon(interior))
+            if d_h:
+                sizes.append(round(d_h, 2))
     return Counter(sizes)
 
 # --- 3. 加工パス生成 ---
@@ -166,9 +166,9 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         if pt:
             drill_points.append(pt)
         for interior in p.interiors:
-            pt_hole = check_p(Polygon(interior))
-            if pt_hole:
-                drill_points.append(pt_hole)
+            pt_h = check_p(Polygon(interior))
+            if pt_h:
+                drill_points.append(pt_h)
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -178,16 +178,13 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     G1 = "G1" if "G0/" in fmt else "G01"
     safe = 5.0
     for pt in points:
-        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}")
-        gc.append(f"{G0} X{pt.x:.3f} Y{pt.y:.3f}")
-        gc.append(f"{G0} Z{z_start + 1.0}")
+        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}\n{G0} X{pt.x:.3f} Y{pt.y:.3f}\n{G0} Z{z_start + 1.0}")
         current_z = z_start
         while current_z > z_final:
             target_z = max(current_z - peck_depth, z_final)
             gc.append(f"{G1} Z{target_z:.3f}")
             if target_z > z_final:
-                gc.append(f"{G0} Z{z_start + 0.5}")
-                gc.append(f"{G0} Z{target_z + 0.5}")
+                gc.append(f"{G0} Z{z_start + 0.5}\n{G0} Z{target_z + 0.5}")
             current_z = target_z
         gc.append(f"{G0} Z{safe}")
     gc.append(footer.strip())
@@ -352,8 +349,8 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("yosikeiCAM 3.5")
-st.caption("Ver 3.5: 絵文字削除・ヘッダー整理版")
+st.title("yosikeiCAM 3.6")
+st.caption("Ver 3.6: レイアウト調整・加工サイズ配置変更版")
 
 with st.sidebar:
     st.header("原点設定")
@@ -418,9 +415,11 @@ if f:
     bn = os.path.splitext(f.name)[0]; polys_raw = dxf_to_shapely_list(f.getvalue())
     if polys_raw:
         tu = unary_union(polys_raw); minx, miny, maxx, maxy = tu.bounds; ox, oy = 0, 0
+        w_size, h_size = maxx-minx, maxy-miny
         if origin.startswith("Bottom-Left"): ox, oy = -minx, -miny
-        elif origin.startswith("Center"): ox, oy = -(minx+(maxx-minx)/2), -(miny+(maxy-miny)/2)
+        elif origin.startswith("Center"): ox, oy = -(minx+w_size/2), -(miny+h_size/2)
         polys_moved = [translate(p, ox, oy) for p in polys_raw]
+        
         st.sidebar.divider(); st.sidebar.subheader("パス選択")
         cont = st.sidebar.container(); all_c = cont.checkbox("すべて選択", value=True, key="sa")
         selected = []
@@ -433,10 +432,12 @@ if f:
             hs = analyze_holes(gfc)
             if hs: st.sidebar.info("検出された円: " + ", ".join([f"φ{d}({c}個)" for d, c in hs.items()]))
         
+        # 加工サイズとヘッダーの表示
+        st.success(f"加工サイズ: {w_size:.1f} x {h_size:.1f} mm")
         st.header("パス生成")
+        
         c1, c2 = st.columns(2)
         with c1:
-            st.success(f"加工サイズ: {maxx-minx:.1f} x {maxy-miny:.1f} mm")
             fig, ax = plt.subplots(figsize=(5,5)); ax.plot(0, 0, 'r+', markersize=20); ax.axhline(0, color='red', alpha=0.3); ax.axvline(0, color='red', alpha=0.3)
             for i, p in enumerate(polys_moved):
                 ax.plot(*p.exterior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
