@@ -145,9 +145,9 @@ def analyze_holes(geometry):
         if d:
             sizes.append(round(d, 2))
         for interior in p.interiors:
-            d_h = check_p(Polygon(interior))
-            if d_h:
-                sizes.append(round(d_h, 2))
+            d_hole = check_p(Polygon(interior))
+            if d_hole:
+                sizes.append(round(d_hole, 2))
     return Counter(sizes)
 
 # --- 3. 加工パス生成 ---
@@ -166,9 +166,9 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         if pt:
             drill_points.append(pt)
         for interior in p.interiors:
-            pt_h = check_p(Polygon(interior))
-            if pt_h:
-                drill_points.append(pt_h)
+            pt_hole = check_p(Polygon(interior))
+            if pt_hole:
+                drill_points.append(pt_hole)
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -178,13 +178,16 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     G1 = "G1" if "G0/" in fmt else "G01"
     safe = 5.0
     for pt in points:
-        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}\n{G0} X{pt.x:.3f} Y{pt.y:.3f}\n{G0} Z{z_start + 1.0}")
+        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}")
+        gc.append(f"{G0} X{pt.x:.3f} Y{pt.y:.3f}")
+        gc.append(f"{G0} Z{z_start + 1.0}")
         current_z = z_start
         while current_z > z_final:
             target_z = max(current_z - peck_depth, z_final)
             gc.append(f"{G1} Z{target_z:.3f}")
             if target_z > z_final:
-                gc.append(f"{G0} Z{z_start + 0.5}\n{G0} Z{target_z + 0.5}")
+                gc.append(f"{G0} Z{z_start + 0.5}")
+                gc.append(f"{G0} Z{target_z + 0.5}")
             current_z = target_z
         gc.append(f"{G0} Z{safe}")
     gc.append(footer.strip())
@@ -349,13 +352,13 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 # --- 5. UI ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
-st.title("⚡ yosikeiCAM 3.4")
-st.caption("Ver 3.4: 面取り2回加工オプション復活版")
+st.title("yosikeiCAM 3.5")
+st.caption("Ver 3.5: 絵文字削除・ヘッダー整理版")
 
 with st.sidebar:
-    st.header("📍 原点設定")
+    st.header("原点設定")
     origin = st.radio("原点基準", ["Bottom-Left (左下)", "Center (中心)", "Original (CAD座標)"], index=0)
-    st.divider(); st.header("⚙️ 加工設定")
+    st.divider(); st.header("加工設定")
     tab1, tab2, tab3, tab4 = st.tabs(["ポケット", "面取り", "Vカーブ", "ドリル"])
     
     with tab1:
@@ -393,7 +396,7 @@ with st.sidebar:
         enable_v = st.checkbox("有効", value=False, key="cv")
         va = st.number_input("角度 (度)", value=60.0, step=10.0)
         ucv = st.checkbox("2回加工 (粗+仕上げ)", value=False, key="uccv")
-        v_cl = 0.0; fed_v_f = 300; fed_v = st.number_input("送り速度 (粗)", value=300, min_value=1, key="fv")
+        v_cl = 0.0; fed_v_f = 300; fed_v = st.number_input("送り速度 (通常/粗)", value=300, min_value=1, key="fv")
         if ucv:
             v_cl = st.number_input("仕上げ代 (mm)", value=0.2, step=0.1)
             fed_v_f = st.number_input("仕上げ送り", value=300, min_value=1, key="fv_f")
@@ -405,10 +408,11 @@ with st.sidebar:
         ddt = st.number_input("対象径 (mm)", value=3.0); ddz = st.number_input("深さ Z", value=-5.0)
         pck = st.number_input("ペック量", value=2.0, min_value=0.1); fd = st.number_input("送り", value=200, key="fd")
         
-    st.divider(); ppn = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys()))
-    pp = POST_PROCESSORS[ppn]; h_c = st.text_area("Header", pp["start"]); f_c = st.text_area("Footer", pp["end"])
+    st.divider(); ppn = st.selectbox("ポストプロセッサ", list(POST_PROCESSORS.keys())); pp = POST_PROCESSORS[ppn]
+    h_c = st.text_area("Header", pp["start"]); f_c = st.text_area("Footer", pp["end"])
 
-st.header("1. DXFアップロード"); f = st.file_uploader("", type=["dxf"])
+st.header("DXFアップロード")
+f = st.file_uploader("", type=["dxf"])
 
 if f:
     bn = os.path.splitext(f.name)[0]; polys_raw = dxf_to_shapely_list(f.getvalue())
@@ -417,7 +421,7 @@ if f:
         if origin.startswith("Bottom-Left"): ox, oy = -minx, -miny
         elif origin.startswith("Center"): ox, oy = -(minx+(maxx-minx)/2), -(miny+(maxy-miny)/2)
         polys_moved = [translate(p, ox, oy) for p in polys_raw]
-        st.sidebar.divider(); st.sidebar.subheader("📐 パス選択")
+        st.sidebar.divider(); st.sidebar.subheader("パス選択")
         cont = st.sidebar.container(); all_c = cont.checkbox("すべて選択", value=True, key="sa")
         selected = []
         for i, p in enumerate(polys_moved):
@@ -426,8 +430,10 @@ if f:
                 
         target_polys = [polys_moved[i] for i in selected]; gfc = merge_polygons_xor(target_polys)
         if gfc:
-            holes = analyze_holes(gfc)
-            if holes: st.sidebar.info("💡 穴: " + ", ".join([f"φ{d}({c}個)" for d, c in holes.items()]))
+            hs = analyze_holes(gfc)
+            if hs: st.sidebar.info("検出された円: " + ", ".join([f"φ{d}({c}個)" for d, c in hs.items()]))
+        
+        st.header("パス生成")
         c1, c2 = st.columns(2)
         with c1:
             st.success(f"加工サイズ: {maxx-minx:.1f} x {maxy-miny:.1f} mm")
@@ -437,7 +443,7 @@ if f:
                 for interior in p.interiors: ax.plot(*interior.xy, 'k-' if i in selected else 'k:', alpha=1.0 if i in selected else 0.1)
             ax.axis('equal'); ax.grid(True, linestyle=':'); st.pyplot(fig)
         with c2:
-            st.header("2. パス生成"); gc_v, gc_p, gc_c, gc_d = None, None, None, None; v_d, p_r_d, p_f_d, c_d = [], [], [], []
+            gc_v, gc_p, gc_c, gc_d = None, None, None, None; v_d, p_r_d, p_f_d, c_d = [], [], [], []
             if gfc and not gfc.is_empty:
                 if enable_v:
                     with st.spinner("VCarve..."):
@@ -465,8 +471,8 @@ if f:
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
             ax2.axis('equal'); st.pyplot(fig2); col1, col2 = st.columns(2)
-            if gc_v: col1.download_button("📥 VCARVE 保存", gc_v, f"{bn}_vcarve.nc")
-            if gc_p: col2.download_button("📥 POCKET 保存", gc_p, f"{bn}_pocket.nc")
-            if gc_c: col1.download_button("📥 CHAMFER 保存", gc_c, f"{bn}_chamfer.nc")
-            if gc_d: col2.download_button("📥 DRILL 保存", gc_d, f"{bn}_drill.nc")
+            if gc_v: col1.download_button("VCARVE 保存", gc_v, f"{bn}_vcarve.nc")
+            if gc_p: col2.download_button("POCKET 保存", gc_p, f"{bn}_pocket.nc")
+            if gc_c: col1.download_button("CHAMFER 保存", gc_c, f"{bn}_chamfer.nc")
+            if gc_d: col2.download_button("DRILL 保存", gc_d, f"{bn}_drill.nc")
     else: st.error("図形が見つかりません。")
