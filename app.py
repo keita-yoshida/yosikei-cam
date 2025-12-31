@@ -21,7 +21,7 @@ from scipy.spatial import Voronoi
 # --- 0. 多言語定義 (辞書) ---
 LANG_DICT = {
     "Japanese": {
-        "title": "yosikeiCAM 4.4",
+        "title": "yosikeiCAM 4.5",
         "origin_setting": "原点設定",
         "origin_option": ["左下 (Bottom-Left)", "中心 (Center)", "CAD座標 (Original)"],
         "process_setting": "加工設定",
@@ -46,7 +46,7 @@ LANG_DICT = {
         "drill_depth": "深さ Z",
         "peck": "ペック量",
         "feed": "送り速度",
-        "post_processor": "ポストプロセッサ",
+        "post_processor": "スタートコード/エンコード",
         "dxf_upload": "DXFアップロード",
         "path_select": "パス選択",
         "select_all": "すべて選択",
@@ -57,7 +57,7 @@ LANG_DICT = {
         "hole_detected": "検出された円"
     },
     "English": {
-        "title": "yosikeiCAM 4.4",
+        "title": "yosikeiCAM 4.5",
         "origin_setting": "Origin Setup",
         "origin_option": ["Bottom-Left", "Center", "Original (CAD)"],
         "process_setting": "Machining Setup",
@@ -82,7 +82,7 @@ LANG_DICT = {
         "drill_depth": "Depth Z",
         "peck": "Peck Amount",
         "feed": "Feed Rate",
-        "post_processor": "Post Processor",
+        "post_processor": "Start Code / End Code",
         "dxf_upload": "DXF Upload",
         "path_select": "Path Selection",
         "select_all": "Select All",
@@ -207,7 +207,6 @@ def merge_polygons_xor(polys):
     return combined
 
 def find_drill_points(geometry, target_dia, tolerance=0.2):
-    """ドリル位置検出ロジック：許容誤差を0.2mmに拡大"""
     polys = ensure_list_of_polys(geometry)
     drill_points = []
     def check_p(p):
@@ -441,7 +440,7 @@ with st.sidebar:
     T = LANG_DICT[lang]
 
 st.title(T["title"])
-st.caption("Ver 4.4: Drill logic and preview synchronization")
+st.caption("Ver 4.5: Name Change and High Stability")
 
 with st.sidebar:
     st.header(T["origin_setting"])
@@ -558,7 +557,6 @@ if f:
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
                 for interior in p.interiors:
                     ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
-            # 左側にドリルポイントを表示
             for pt in drill_points_found:
                 ax.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
             ax.axis('equal')
@@ -593,24 +591,20 @@ if f:
                     if fp_c: phs_c.append({'name':'Finish','paths':fp_c,'z_start':0,'z_final':z_c,'feed':fc_f if ucf else fc_r})
                     if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp["format"])
                 if enable_d:
-                    # Gコード生成
                     gc_d = generate_drill_gcode(drill_points_found, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=20)
-            ax2.axhline(0, color='red', alpha=0.3)
-            ax2.axvline(0, color='red', alpha=0.3)
+            ax2.axhline(0, color='red', alpha=0.3); ax2.axvline(0, color='red', alpha=0.3)
             for p in polys_moved:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.05)
             for ls in p_r_d: ax2.plot(*ls.xy, color='tab:blue', alpha=0.3)
             for ls in p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
-            # 右側にもドリルポイントを表示（同期）
             for pt in drill_points_found:
                 ax2.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
-            ax2.axis('equal')
-            ax2.grid(True, linestyle=':')
+            ax2.axis('equal'); ax2.grid(True, linestyle=':')
             st.pyplot(fig2)
             
             dl_c1, dl_c2 = st.columns(2)
