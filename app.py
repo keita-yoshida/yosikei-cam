@@ -21,7 +21,7 @@ from scipy.spatial import Voronoi
 # --- 0. 多言語定義 (辞書) ---
 LANG_DICT = {
     "Japanese": {
-        "title": "yosikeiCAM 4.1",
+        "title": "yosikeiCAM 4.2",
         "origin_setting": "原点設定",
         "origin_option": ["左下 (Bottom-Left)", "中心 (Center)", "CAD座標 (Original)"],
         "process_setting": "加工設定",
@@ -57,7 +57,7 @@ LANG_DICT = {
         "hole_detected": "検出された円"
     },
     "English": {
-        "title": "yosikeiCAM 4.1",
+        "title": "yosikeiCAM 4.2",
         "origin_setting": "Origin Setup",
         "origin_option": ["Bottom-Left", "Center", "Original (CAD)"],
         "process_setting": "Machining Setup",
@@ -113,7 +113,7 @@ POST_PROCESSORS = {
     }
 }
 
-# --- 2. 幾何学ユーティリティ (中略：V 4.0と同様) ---
+# --- 2. 幾何学ユーティリティ ---
 
 def ensure_list_of_polys(geometry):
     if geometry is None or geometry.is_empty: return []
@@ -183,9 +183,13 @@ def find_drill_points(geometry, target_dia, tolerance=0.1):
         if not (target_dia - tolerance <= w <= target_dia + tolerance): return None
         return p.centroid
     for p in polys:
-        pt = check_p(p); if pt: drill_points.append(pt)
+        pt = check_p(p)
+        if pt: 
+            drill_points.append(pt)
         for interior in p.interiors:
-            pt_h = check_p(Polygon(interior)); if pt_h: drill_points.append(pt_h)
+            pt_h = check_p(Polygon(interior))
+            if pt_h: 
+                drill_points.append(pt_h)
     return drill_points
 
 def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
@@ -263,7 +267,9 @@ class PathGraph:
         return chains
 
 def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offset=0.0):
-    polys = ensure_list_of_polys(geometry); if not polys: return []
+    polys = ensure_list_of_polys(geometry)
+    if not polys:
+        return []
     tan_a, graph, boundary = np.tan(np.radians(angle_deg/2)), PathGraph(), unary_union(polys).boundary
     for poly in polys:
         smooth = poly.simplify(0.02, preserve_topology=True); line = smooth.exterior; sample_res = 0.2
@@ -316,13 +322,12 @@ def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01",
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
 
-# 言語選択
 with st.sidebar:
     lang = st.selectbox("Language / 言語", list(LANG_DICT.keys()))
-    T = LANG_DICT[lang] # 選択された言語辞書
+    T = LANG_DICT[lang]
 
 st.title(T["title"])
-st.caption(f"Ver 4.1: Multi-language Support")
+st.caption(f"Ver 4.2: Bug Fix & Multi-language")
 
 with st.sidebar:
     st.header(T["origin_setting"])
@@ -415,7 +420,7 @@ if f:
                 if enable_p:
                     p_r, p_f = generate_pocket(gfc, dia, clear if ucp else 0.0, 0.5); p_r_d, p_f_d = p_r, p_f; phs = []
                     if p_r: phs.append({'name':'Rough','paths':p_r,'z_start':0,'z_final':dep_p,'feed':f_p_r,'z_step':stp_p})
-                    if p_f and ucp: phs.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode=="Full-Depth" else stp_p)})
+                    if p_f and ucp: phs.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode==T["depth_options"][1] else stp_p)})
                     if phs: gc_p = make_gcode_phases_advanced(phs, "EndMill", h_c, f_c, pp["format"])
                 if enable_c:
                     rp_c, fp_c = generate_chamfer_separated(gfc, to, cfa if ucf else 0.0); c_d = rp_c + fp_c; phs_c = []
