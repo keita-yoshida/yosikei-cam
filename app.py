@@ -21,7 +21,7 @@ from scipy.spatial import Voronoi
 # --- 0. 多言語定義 (辞書) ---
 LANG_DICT = {
     "Japanese": {
-        "title": "yosikeiCAM 4.3",
+        "title": "yosikeiCAM 4.4",
         "origin_setting": "原点設定",
         "origin_option": ["左下 (Bottom-Left)", "中心 (Center)", "CAD座標 (Original)"],
         "process_setting": "加工設定",
@@ -57,7 +57,7 @@ LANG_DICT = {
         "hole_detected": "検出された円"
     },
     "English": {
-        "title": "yosikeiCAM 4.3",
+        "title": "yosikeiCAM 4.4",
         "origin_setting": "Origin Setup",
         "origin_option": ["Bottom-Left", "Center", "Original (CAD)"],
         "process_setting": "Machining Setup",
@@ -103,7 +103,7 @@ POST_PROCESSORS = {
     },
     "GRBL / Candle": {
         "start": "G21 G90 G17\nG0 Z10.0\nM3 S10000",
-        "end": "M5\nG0 Z10.0\nM30",
+        "end": "M5 G0 Z10.0\nM30",
         "format": "G0/G1"
     },
     "Mach3 / Mach4": {
@@ -206,7 +206,8 @@ def merge_polygons_xor(polys):
             combined = combined.symmetric_difference(p)
     return combined
 
-def find_drill_points(geometry, target_dia, tolerance=0.1):
+def find_drill_points(geometry, target_dia, tolerance=0.2):
+    """ドリル位置検出ロジック：許容誤差を0.2mmに拡大"""
     polys = ensure_list_of_polys(geometry)
     drill_points = []
     def check_p(p):
@@ -440,7 +441,7 @@ with st.sidebar:
     T = LANG_DICT[lang]
 
 st.title(T["title"])
-st.caption("Ver 4.3: High Stability Version")
+st.caption("Ver 4.4: Drill logic and preview synchronization")
 
 with st.sidebar:
     st.header(T["origin_setting"])
@@ -533,11 +534,14 @@ if f:
         target_polys = [polys_moved[i] for i in selected]
         gfc = merge_polygons_xor(target_polys)
         
+        # 穴情報の解析
+        drill_points_found = []
         if gfc:
-            # NameError対策：安全な改行形式での代入
             hs = analyze_holes(gfc)
             if hs:
                 st.sidebar.info(f"{T['hole_detected']}: " + ", ".join([f"φ{d}({c})" for d, c in hs.items()]))
+            if enable_d:
+                drill_points_found = find_drill_points(gfc, ddt)
         
         st.success(f"{T['size_display']}: {w_size:.1f} x {h_size:.1f} mm")
         st.header(T["gen_header"])
@@ -554,6 +558,9 @@ if f:
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
                 for interior in p.interiors:
                     ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
+            # 左側にドリルポイントを表示
+            for pt in drill_points_found:
+                ax.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
             ax.axis('equal')
             ax.grid(True, linestyle=':')
             st.pyplot(fig)
@@ -576,7 +583,7 @@ if f:
                     p_r_d, p_f_d = p_r, p_f
                     phs_p = []
                     if p_r: phs_p.append({'name':'Rough','paths':p_r,'z_start':0,'z_final':dep_p,'feed':f_p_r,'z_step':stp_p})
-                    if p_f and ucp: phs_p.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode=="Full-Depth" else stp_p)})
+                    if p_f and ucp: phs_p.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode==T["depth_options"][1] else stp_p)})
                     if phs_p: gc_p = make_gcode_phases_advanced(phs_p, "EndMill", h_c, f_c, pp["format"])
                 if enable_c:
                     rp_c, fp_c = generate_chamfer_separated(gfc, to, cfa if ucf else 0.0)
@@ -586,8 +593,8 @@ if f:
                     if fp_c: phs_c.append({'name':'Finish','paths':fp_c,'z_start':0,'z_final':z_c,'feed':fc_f if ucf else fc_r})
                     if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp["format"])
                 if enable_d:
-                    dpts = find_drill_points(gfc, ddt)
-                    if dpts: gc_d = generate_drill_gcode(dpts, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
+                    # Gコード生成
+                    gc_d = generate_drill_gcode(drill_points_found, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=20)
@@ -599,6 +606,9 @@ if f:
             for ls in p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
+            # 右側にもドリルポイントを表示（同期）
+            for pt in drill_points_found:
+                ax2.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
             ax2.axis('equal')
             ax2.grid(True, linestyle=':')
             st.pyplot(fig2)
