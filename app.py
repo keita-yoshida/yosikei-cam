@@ -59,6 +59,8 @@ LANG_DICT = {
         "download": ["VCARVE 保存", "POCKET 保存", "CHAMFER 保存", "DRILL 保存"],
         "error_no_geom": "図形が見つかりません。",
         "hole_detected": "検出された円",
+        "out_tol": "出力公差 (円弧・直線近似, mm)",
+        "file_size": "{name}: {kb:.1f} KB / {lines} 行",
         "preview_header": "3D 加工プレビュー",
         "preview_enable": "3Dプレビューを表示",
         "stock_thickness": "材料厚さ (mm)",
@@ -103,6 +105,8 @@ LANG_DICT = {
         "download": ["Save VCARVE", "Save POCKET", "Save CHAMFER", "Save DRILL"],
         "error_no_geom": "No valid geometry found.",
         "hole_detected": "Circles detected",
+        "out_tol": "Output Tolerance (arc/line fitting, mm)",
+        "file_size": "{name}: {kb:.1f} KB / {lines} lines",
         "preview_header": "3D Machining Preview",
         "preview_enable": "Show 3D preview",
         "stock_thickness": "Stock Thickness (mm)",
@@ -115,21 +119,30 @@ LANG_DICT = {
 }
 
 # --- 1. ポストプロセッサ定義 ---
+# format  : G0/G1 か G00/G01 か
+# comment : コメント形式 (";" または Fanuc 系の "()")
+# tool_change : T1 M06 を出力するか (ATC なしの機械では False)
+# canned_drill: ドリルを G81/G83 固定サイクルで出力するか
 POST_PROCESSORS = {
     "Generic (汎用)": {
         "start": "G21 ; Metric\nG90 ; Absolute\nG00 Z10.0 ; Safe Z\nM3 S10000 ; Spindle On",
         "end": "M5 ; Spindle Off\nG00 Z10.0\nM30 ; End",
-        "format": "G00/G01"
+        "format": "G00/G01", "comment": ";", "tool_change": True, "canned_drill": False
     },
     "GRBL / Candle": {
         "start": "G21 G90 G17\nG0 Z10.0\nM3 S10000",
         "end": "M5 G0 Z10.0\nM30",
-        "format": "G0/G1"
+        "format": "G0/G1", "comment": ";", "tool_change": True, "canned_drill": False
     },
     "Mach3 / Mach4": {
         "start": "G21 G90 G40 G80\nG00 Z10.0\nM03 S10000",
         "end": "M05\nG00 Z10.0\nM30",
-        "format": "G00/G01"
+        "format": "G00/G01", "comment": ";", "tool_change": True, "canned_drill": False
+    },
+    "Fanuc 0M (ATCなし)": {
+        "start": "%\nO0001 (YOSIKEICAM)\nG17 G21 G40 G49 G80 G90\nG54\nG00 Z10.\nM03 S5000",
+        "end": "M05\nG91 G28 Z0.\nG90\nM30\n%",
+        "format": "G00/G01", "comment": "()", "tool_change": False, "canned_drill": True
     }
 }
 
@@ -247,27 +260,192 @@ def find_drill_points(geometry, target_dia, tolerance=0.2):
                 drill_points.append(pt_h)
     return drill_points
 
-def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, fmt):
+def fmt_num(v):
+    """座標値を小数点以下3桁までに丸め、末尾の0を省いて出力する (例: 5.0 -> "5.", -1.25 -> "-1.25")。
+    Fanuc では小数点のない値が最小設定単位 (0.001mm) 扱いになるため、小数点は必ず残す。"""
+    s = f"{v:.3f}".rstrip('0')
+    return "0." if s in ("-0.", "0.") else s
+
+class GcodeWriter:
+    """モーダル (G コード・座標・送り) が変わらない語を省略してGコードを組み立てる。"""
+    def __init__(self, post):
+        self.post = post
+        short = "G0/" in post["format"]
+        self.codes = {0: "G0", 1: "G1", 2: "G2", 3: "G3"} if short else \
+                     {0: "G00", 1: "G01", 2: "G02", 3: "G03"}
+        self.lines = []
+        self.reset_modal()
+
+    def reset_modal(self):
+        self.motion, self.pos, self.feed = None, {}, None
+
+    def raw(self, text):
+        for line in text.strip().splitlines():
+            self.lines.append(line.rstrip())
+        self.reset_modal()
+
+    def comment(self, text):
+        if self.post.get("comment") == "()":
+            # 古い Fanuc は小文字・全角・括弧を受け付けないことがあるので英大文字のみにする
+            text = re.sub(r'[^A-Z0-9 .,:+\-/=*#]', ' ', text.upper()).strip()
+            self.lines.append(f"({text})")
+        else:
+            self.lines.append(f"; {text}")
+
+    def move(self, motion, x=None, y=None, z=None, feed=None, i=None, j=None):
+        words = []
+        for axis, v in (("X", x), ("Y", y), ("Z", z)):
+            if v is None:
+                continue
+            s = fmt_num(v)
+            if self.pos.get(axis) != s:
+                words.append(axis + s)
+                self.pos[axis] = s
+        if motion in (2, 3):
+            words += [f"I{fmt_num(i)}", f"J{fmt_num(j)}"]
+        elif not words:
+            return
+        if motion != 0 and feed is not None and feed != self.feed:
+            words.append(f"F{int(feed)}")
+            self.feed = feed
+        if motion != self.motion:
+            words.insert(0, self.codes[motion])
+            self.motion = motion
+        self.lines.append(" ".join(words))
+
+    def current_xy(self):
+        return float(self.pos["X"]), float(self.pos["Y"])
+
+    def text(self):
+        return "\n".join(self.lines) + "\n"
+
+def _circle_through(a, b, c):
+    d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]))
+    if abs(d) < 1e-12:
+        return None
+    a2, b2, c2 = a @ a, b @ b, c @ c
+    ux = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d
+    uy = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d
+    return np.array([ux, uy])
+
+def _arc_fit(pts, i, j, tol):
+    """pts[i..j] が1本の円弧で公差内に収まれば (中心, CCWか) を返す。"""
+    seg = pts[i:j + 1]
+    center = _circle_through(seg[0], seg[len(seg) // 2], seg[-1])
+    if center is None:
+        return None
+    r = np.hypot(*(seg[0] - center))
+    if r > 2000.0 or r < 0.05:
+        return None
+    if np.max(np.abs(np.hypot(*(seg - center).T) - r)) > tol:
+        return None
+    # 各弦のふくらみ (サジッタ) も公差内か
+    chord = np.hypot(*np.diff(seg, axis=0).T)
+    if np.max(chord) ** 2 / (8.0 * r) > tol:
+        return None
+    ang = np.unwrap(np.arctan2(seg[:, 1] - center[1], seg[:, 0] - center[0]))
+    d_ang = np.diff(ang)
+    if not (np.all(d_ang > 0) or np.all(d_ang < 0)):
+        return None
+    if abs(ang[-1] - ang[0]) > np.radians(350):
+        return None
+    return center, bool(d_ang[0] > 0)
+
+def fit_path(coords, tol):
+    """2D 点列を直線と円弧の列 [('L', 終点), ('A', 終点, 中心, ccw)] に変換する。"""
+    pts = np.asarray(coords, dtype=float)[:, :2]
+    keep = np.r_[True, np.hypot(*np.diff(pts, axis=0).T) > 1e-6]
+    pts = pts[keep]
+    ops, line_run, i, n = [], [pts[0]], 0, len(pts)
+    def flush_lines():
+        if len(line_run) > 1:
+            simple = LineString(line_run).simplify(tol, preserve_topology=False)
+            for p in list(simple.coords)[1:]:
+                ops.append(('L', np.array(p)))
+    while i < n - 1:
+        best, j = None, i + 3
+        # 伸ばせるだけ伸ばし (倍々), 失敗したら二分探索で最長の円弧を探す
+        if j < n and _arc_fit(pts, i, j, tol):
+            lo, step = j, 4
+            while True:
+                hi = min(n - 1, lo + step)
+                if hi == lo or not _arc_fit(pts, i, hi, tol):
+                    break
+                lo, step = hi, step * 2
+            if hi != lo:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if _arc_fit(pts, i, mid, tol):
+                        lo = mid
+                    else:
+                        hi = mid
+            best = lo
+        if best is None:
+            line_run.append(pts[i + 1])
+            i += 1
+            continue
+        center, ccw = _arc_fit(pts, i, best, tol)
+        flush_lines()
+        ops.append(('A', pts[best], center, ccw))
+        line_run = [pts[best]]
+        i = best
+    flush_lines()
+    return pts[0], ops
+
+def write_path_2d(w, start, ops, feed):
+    for op in ops:
+        if op[0] == 'L':
+            w.move(1, x=op[1][0], y=op[1][1], feed=feed)
+        else:
+            _, end, center, ccw = op
+            sx, sy = w.current_xy()
+            w.move(3 if ccw else 2, x=end[0], y=end[1], feed=feed,
+                   i=center[0] - sx, j=center[1] - sy)
+
+def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, header, footer, post):
     if not points:
         return None
-    gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06", f"F{int(feed)}", ""]
-    G0, G1 = ("G0", "G1") if "G0/" in fmt else ("G00", "G01")
-    safe = 5.0
-    for pt in points:
-        gc.append(f"; Drill X{pt.x:.3f} Y{pt.y:.3f}")
-        gc.append(f"{G0} X{pt.x:.3f} Y{pt.y:.3f}")
-        gc.append(f"{G0} Z{z_start + 1.0}")
-        current_z = z_start
-        while current_z > z_final:
-            target_z = max(current_z - peck_depth, z_final)
-            gc.append(f"{G1} Z{target_z:.3f}")
-            if target_z > z_final:
-                gc.append(f"{G0} Z{z_start + 0.5}")
-                gc.append(f"{G0} Z{target_z + 0.5}")
-            current_z = target_z
-        gc.append(f"{G0} Z{safe}")
-    gc.append(footer.strip())
-    return "\n".join(gc)
+    w = GcodeWriter(post)
+    w.raw(header)
+    w.comment(f"TOOL: {tool_name}")
+    if post.get("tool_change"):
+        w.raw("T1 M06")
+    safe, r_plane = 5.0, z_start + 1.0
+    w.move(0, z=safe)
+    if post.get("canned_drill"):
+        # G98: 穴と穴の間はイニシャル点 (安全高さ) まで戻る。
+        # Q は小数点を受け付けない古い機種でも同じ意味になるよう 0.001mm 単位の整数で出す。
+        peck = peck_depth < abs(z_final - z_start)
+        cycle_words = f"Z{fmt_num(z_final)} R{fmt_num(r_plane)}" + \
+            (f" Q{int(round(peck_depth * 1000))}" if peck else "")
+        prev = (None, None)
+        for k, pt in enumerate(points):
+            xy = (fmt_num(pt.x), fmt_num(pt.y))
+            words = [a + v for a, v, p in zip("XY", xy, prev) if v != p]
+            if k == 0:
+                w.lines.append(f"G98 {'G83' if peck else 'G81'} {' '.join(words)} {cycle_words} F{int(feed)}")
+            elif words:
+                w.lines.append(" ".join(words))
+            prev = xy
+        w.lines.append("G80")
+        w.reset_modal()
+        w.move(0, z=safe)
+    else:
+        for pt in points:
+            w.comment(f"Drill X{fmt_num(pt.x)} Y{fmt_num(pt.y)}")
+            w.move(0, x=pt.x, y=pt.y)
+            w.move(0, z=r_plane)
+            current_z = z_start
+            while current_z > z_final:
+                target_z = max(current_z - peck_depth, z_final)
+                w.move(1, z=target_z, feed=feed)
+                if target_z > z_final:
+                    w.move(0, z=z_start + 0.5)
+                    w.move(0, z=target_z + 0.5)
+                current_z = target_z
+            w.move(0, z=safe)
+    w.raw(footer)
+    return w.text()
 
 def generate_pocket(geometry, tool_d, clearance, stepover):
     paths_rough, paths_finish = [], []
@@ -398,40 +576,41 @@ def generate_vcarve(geometry, angle_deg, use_limit, max_d, step_len=0.1, z_offse
             all_paths.append(douglas_peucker(path_3d, 0.02))
     return all_paths
 
-def make_gcode_phases_advanced(phases, tool_name, header, footer, fmt="G00/G01", is_3d=False):
-    gc = [header.strip(), f"; Tool: {tool_name}", "T1 M06"]
-    G0, G1 = ("G0", "G1") if "G0/" in fmt else ("G00", "G01")
+def make_gcode_phases_advanced(phases, tool_name, header, footer, post, is_3d=False, tol=0.01):
+    w = GcodeWriter(post)
+    w.raw(header)
+    w.comment(f"TOOL: {tool_name}")
+    if post.get("tool_change"):
+        w.raw("T1 M06")
     safe = 5.0
-    gc.append(f"{G0} Z{safe}")
+    w.move(0, z=safe)
     for i, phase in enumerate(phases):
         p_list = phase.get('paths', [])
         if not p_list: continue
         feed, z_start, z_final = int(phase.get('feed', 300)), phase.get('z_start', 0), phase.get('z_final', 0)
         z_step = max(0.01, phase.get('z_step', abs(z_final - z_start)))
-        gc.append(f"; Phase {i+1}: {phase.get('name','')}")
-        gc.append(f"F{feed}")
+        w.comment(f"Phase {i+1}: {phase.get('name','')}")
         if is_3d:
             for p_pts in p_list:
-                gc.append(f"{G0} X{p_pts[0][0]:.3f} Y{p_pts[0][1]:.3f}")
-                gc.append(f"{G1} Z{p_pts[0][2]:.3f}")
+                w.move(0, x=p_pts[0][0], y=p_pts[0][1])
+                w.move(1, z=p_pts[0][2], feed=feed)
                 for p in p_pts[1:]:
-                    gc.append(f"{G1} X{p[0]:.3f} Y{p[1]:.3f} Z{p[2]:.3f}")
-                gc.append(f"{G0} Z{safe}")
+                    w.move(1, x=p[0], y=p[1], z=p[2], feed=feed)
+                w.move(0, z=safe)
         else:
+            fitted = [fit_path(path.coords, tol) for path in p_list]
             cur_z = z_start
-            while cur_z > z_final:
+            while cur_z > z_final + 1e-9:
                 tgt_z = max(cur_z - z_step, z_final)
-                for path in p_list:
-                    coords = np.array(path.coords)
-                    gc.append(f"{G0} X{coords[0,0]:.3f} Y{coords[0,1]:.3f}")
-                    gc.append(f"{G0} Z{cur_z + 1.0}")
-                    gc.append(f"{G1} Z{tgt_z:.3f}")
-                    for xy in coords[1:]:
-                        gc.append(f"{G1} X{xy[0]:.3f} Y{xy[1]:.3f}")
-                    gc.append(f"{G0} Z{safe}")
+                for start, ops in fitted:
+                    w.move(0, x=start[0], y=start[1])
+                    w.move(0, z=cur_z + 1.0)
+                    w.move(1, z=tgt_z, feed=feed)
+                    write_path_2d(w, start, ops, feed)
+                    w.move(0, z=safe)
                 cur_z = tgt_z
-    gc.append(footer.strip())
-    return "\n".join(gc)
+    w.raw(footer)
+    return w.text()
 
 def analyze_holes(geometry):
     polys = ensure_list_of_polys(geometry)
@@ -454,35 +633,71 @@ def analyze_holes(geometry):
 # 生成したGコードを読み直し、工具形状を材料表面に押し当てて削り残り形状を計算する。
 # 「意図した形状」ではなく「Gコードが実際に削る形状」を表示するので、パスの検証にも使える。
 
-GCODE_WORD = re.compile(r'([GXYZ])\s*(-?\d*\.?\d+)')
+GCODE_WORD = re.compile(r'([A-Z])\s*([-+]?\d*\.?\d*)')
+
+def _arc_points(x0, y0, z0, x1, y1, z1, cx, cy, ccw, max_seg=0.2):
+    a0 = math.atan2(y0 - cy, x0 - cx)
+    a1 = math.atan2(y1 - cy, x1 - cx)
+    sweep = a1 - a0
+    if ccw and sweep <= 1e-9:
+        sweep += 2 * math.pi
+    elif not ccw and sweep >= -1e-9:
+        sweep -= 2 * math.pi
+    r = math.hypot(x0 - cx, y0 - cy)
+    n = max(2, int(math.ceil(abs(sweep) * r / max_seg)))
+    t = np.linspace(0.0, 1.0, n + 1)
+    a = a0 + sweep * t
+    return np.c_[cx + r * np.cos(a), cy + r * np.sin(a), z0 + (z1 - z0) * t]
 
 def parse_gcode_moves(gcode, safe_z=5.0):
-    """G1移動を (N, 6) の線分配列 [x0,y0,z0,x1,y1,z1] で返す。XY方向の早送りで材料内にいる回数も返す。"""
+    """切削移動 (G1/G2/G3/穴あけ固定サイクル) を (N, 6) の線分配列 [x0,y0,z0,x1,y1,z1] で返す。
+    XY方向の早送りで材料内にいる回数も返す。"""
     segs, rapid_hits = [], 0
     x = y = None
     z = safe_z
-    mode = 0
+    mode, cycle, cyc_z, cyc_r = 0, None, None, None
     for raw in gcode.splitlines():
-        line = raw.split(';')[0].split('(')[0].upper()
-        if not line.strip():
-            continue
-        nx, ny, nz, has_move = x, y, z, False
-        for w, v in GCODE_WORD.findall(line):
+        line = re.sub(r'\(.*?\)', '', raw.split(';')[0]).upper()
+        words = [(w, v) for w, v in GCODE_WORD.findall(line) if v not in ('', '+', '-', '.')]
+        gs = [float(v) for w, v in words if w == 'G']
+        if 28 in gs or 30 in gs or 92 in gs:
+            continue  # 原点復帰・座標系設定はシミュレーション対象外
+        nx, ny, nz, has_xy, has_z = x, y, z, False, False
+        ij, new_r = [0.0, 0.0], None
+        for w, v in words:
             v = float(v)
-            if w == 'G':
-                if v in (0, 1):
-                    mode = int(v)
-            elif w == 'X':
-                nx, has_move = v, True
-            elif w == 'Y':
-                ny, has_move = v, True
-            elif w == 'Z':
-                nz, has_move = v, True
-        if not has_move:
+            if w == 'X': nx, has_xy = v, True
+            elif w == 'Y': ny, has_xy = v, True
+            elif w == 'Z': nz, has_z = v, True
+            elif w == 'I': ij[0] = v
+            elif w == 'J': ij[1] = v
+            elif w == 'R': new_r = v
+        for g in gs:
+            if g in (0, 1, 2, 3):
+                mode, cycle = int(g), None
+            elif g in (73, 81, 82, 83, 85, 86, 89):
+                cycle = int(g)
+            elif g == 80:
+                cycle = None
+        if cycle is not None:
+            if has_z: cyc_z = nz
+            if new_r is not None: cyc_r = new_r
+            if has_xy:
+                # イニシャル点で XY 位置決めしてから R 点→Z 点まで穴あけ
+                if x is not None and min(z, z) < 0 and (nx, ny) != (x, y):
+                    rapid_hits += 1
+                if cyc_z is not None and cyc_r is not None:
+                    segs.append((nx, ny, cyc_r, nx, ny, cyc_z))
+                x, y = nx, ny
+            continue
+        if not (has_xy or has_z):
             continue
         if x is not None and y is not None and nx is not None and ny is not None:
             if mode == 1:
                 segs.append((x, y, z, nx, ny, nz))
+            elif mode in (2, 3):
+                pts = _arc_points(x, y, z, nx, ny, nz, x + ij[0], y + ij[1], mode == 3)
+                segs.extend(np.c_[pts[:-1], pts[1:]].tolist())
             elif (nx, ny) != (x, y) and min(z, nz) < 0:
                 rapid_hits += 1
         x, y, z = nx, ny, nz
@@ -646,6 +861,7 @@ with st.sidebar:
     pp = POST_PROCESSORS[ppn]
     h_c = st.text_area("Header", pp["start"])
     f_c = st.text_area("Footer", pp["end"])
+    out_tol = st.number_input(T["out_tol"], value=0.01, min_value=0.001, max_value=0.1, step=0.005, format="%.3f")
 
     st.divider()
     st.header(T["preview_header"])
@@ -721,23 +937,23 @@ if f:
                         phs_v = []
                         if v_r_ps: phs_v.append({'name':'V-Rough','paths':v_r_ps,'z_start':0,'z_final':0,'feed':fv})
                         if v_f_ps: phs_v.append({'name':'V-Finish','paths':v_f_ps,'z_start':0,'z_final':0,'feed':fvf if ucv else fv})
-                        if phs_v: gc_v = make_gcode_phases_advanced(phs_v, "VBit", h_c, f_c, pp["format"], True)
+                        if phs_v: gc_v = make_gcode_phases_advanced(phs_v, "VBit", h_c, f_c, pp, True)
                 if enable_p:
                     p_r, p_f = generate_pocket(gfc, dia, clear if ucp else 0.0, 0.5)
                     p_r_d, p_f_d = p_r, p_f
                     phs_p = []
                     if p_r: phs_p.append({'name':'Rough','paths':p_r,'z_start':0,'z_final':dep_p,'feed':f_p_r,'z_step':stp_p})
                     if p_f and ucp: phs_p.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode==T["depth_options"][1] else stp_p)})
-                    if phs_p: gc_p = make_gcode_phases_advanced(phs_p, "EndMill", h_c, f_c, pp["format"])
+                    if phs_p: gc_p = make_gcode_phases_advanced(phs_p, "EndMill", h_c, f_c, pp, tol=out_tol)
                 if enable_c:
                     rp_c, fp_c = generate_chamfer_separated(gfc, to, cfa if ucf else 0.0)
                     c_d = rp_c + fp_c
                     phs_c = []
                     if rp_c and ucf: phs_c.append({'name':'Rough','paths':rp_c,'z_start':0,'z_final':z_c,'feed':fc_r})
                     if fp_c: phs_c.append({'name':'Finish','paths':fp_c,'z_start':0,'z_final':z_c,'feed':fc_f if ucf else fc_r})
-                    if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp["format"])
+                    if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp, tol=out_tol)
                 if enable_d:
-                    gc_d = generate_drill_gcode(drill_points_found, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp["format"])
+                    gc_d = generate_drill_gcode(drill_points_found, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp)
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=20)
@@ -758,6 +974,10 @@ if f:
             if gc_p: dl_c2.download_button(T["download"][1], gc_p, f"{bn}_pocket.nc")
             if gc_c: dl_c1.download_button(T["download"][2], gc_c, f"{bn}_chamfer.nc")
             if gc_d: dl_c2.download_button(T["download"][3], gc_d, f"{bn}_drill.nc")
+            # 内蔵メモリ運転の目安になるよう、各ファイルのサイズを表示する
+            for name, gc in (("VCARVE", gc_v), ("POCKET", gc_p), ("CHAMFER", gc_c), ("DRILL", gc_d)):
+                if gc:
+                    st.caption(T["file_size"].format(name=name, kb=len(gc.encode()) / 1024, lines=gc.count("\n")))
 
         if show_3d:
             st.header(T["preview_header"])
