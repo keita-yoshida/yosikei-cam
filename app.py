@@ -1,9 +1,11 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import tempfile
 import os
 import math
+import re
 from collections import Counter
 
 # 幾何学計算ライブラリ
@@ -17,11 +19,13 @@ import ezdxf.path
 
 # Vカービング用
 from scipy.spatial import Voronoi
+# 3Dプレビュー用
+from scipy.ndimage import grey_erosion
 
 # --- 0. 多言語定義 (辞書) ---
 LANG_DICT = {
     "Japanese": {
-        "title": "yosikeiCAM 4.5",
+        "title": "yosikeiCAM 4.6",
         "origin_setting": "原点設定",
         "origin_option": ["左下 (Bottom-Left)", "中心 (Center)", "CAD座標 (Original)"],
         "process_setting": "加工設定",
@@ -54,10 +58,18 @@ LANG_DICT = {
         "gen_header": "パス生成",
         "download": ["VCARVE 保存", "POCKET 保存", "CHAMFER 保存", "DRILL 保存"],
         "error_no_geom": "図形が見つかりません。",
-        "hole_detected": "検出された円"
+        "hole_detected": "検出された円",
+        "preview_header": "3D 加工プレビュー",
+        "preview_enable": "3Dプレビューを表示",
+        "stock_thickness": "材料厚さ (mm)",
+        "sim_resolution": "シミュレーション解像度 (mm)",
+        "preview_running": "加工シミュレーション中...",
+        "preview_none": "プレビューするパスがありません。",
+        "rapid_warning": "早送り(G0)で材料内をXY移動している箇所が {n} 件あります。",
+        "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット)。"
     },
     "English": {
-        "title": "yosikeiCAM 4.5",
+        "title": "yosikeiCAM 4.6",
         "origin_setting": "Origin Setup",
         "origin_option": ["Bottom-Left", "Center", "Original (CAD)"],
         "process_setting": "Machining Setup",
@@ -90,7 +102,15 @@ LANG_DICT = {
         "gen_header": "Toolpath Generation",
         "download": ["Save VCARVE", "Save POCKET", "Save CHAMFER", "Save DRILL"],
         "error_no_geom": "No valid geometry found.",
-        "hole_detected": "Circles detected"
+        "hole_detected": "Circles detected",
+        "preview_header": "3D Machining Preview",
+        "preview_enable": "Show 3D preview",
+        "stock_thickness": "Stock Thickness (mm)",
+        "sim_resolution": "Simulation Resolution (mm)",
+        "preview_running": "Simulating material removal...",
+        "preview_none": "No toolpaths to preview.",
+        "rapid_warning": "{n} rapid (G0) XY move(s) run inside the stock.",
+        "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat)."
     }
 }
 
@@ -170,7 +190,7 @@ def dxf_to_shapely_list(dxf_bytes):
             if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE', 'CIRCLE'):
                 try:
                     if e.dxftype() == 'CIRCLE':
-                        poly = Point(e.dxf.center[:2]).buffer(e.dxf.radius, resolution=64)
+                        poly = Point(e.dxf.center.x, e.dxf.center.y).buffer(e.dxf.radius, resolution=64)
                     else:
                         p_obj = ezdxf.path.make_path(e)
                         pts = list(p_obj.flattening(0.01))
@@ -430,6 +450,126 @@ def analyze_holes(geometry):
             if d_h: sizes.append(round(d_h, 2))
     return Counter(sizes)
 
+# --- 2.5 加工シミュレーション (Zマップ / ハイトマップ方式) ---
+# 生成したGコードを読み直し、工具形状を材料表面に押し当てて削り残り形状を計算する。
+# 「意図した形状」ではなく「Gコードが実際に削る形状」を表示するので、パスの検証にも使える。
+
+GCODE_WORD = re.compile(r'([GXYZ])\s*(-?\d*\.?\d+)')
+
+def parse_gcode_moves(gcode, safe_z=5.0):
+    """G1移動を (N, 6) の線分配列 [x0,y0,z0,x1,y1,z1] で返す。XY方向の早送りで材料内にいる回数も返す。"""
+    segs, rapid_hits = [], 0
+    x = y = None
+    z = safe_z
+    mode = 0
+    for raw in gcode.splitlines():
+        line = raw.split(';')[0].split('(')[0].upper()
+        if not line.strip():
+            continue
+        nx, ny, nz, has_move = x, y, z, False
+        for w, v in GCODE_WORD.findall(line):
+            v = float(v)
+            if w == 'G':
+                if v in (0, 1):
+                    mode = int(v)
+            elif w == 'X':
+                nx, has_move = v, True
+            elif w == 'Y':
+                ny, has_move = v, True
+            elif w == 'Z':
+                nz, has_move = v, True
+        if not has_move:
+            continue
+        if x is not None and y is not None and nx is not None and ny is not None:
+            if mode == 1:
+                segs.append((x, y, z, nx, ny, nz))
+            elif (nx, ny) != (x, y) and min(z, nz) < 0:
+                rapid_hits += 1
+        x, y, z = nx, ny, nz
+    return np.array(segs, dtype=float).reshape(-1, 6), rapid_hits
+
+def tool_center_field(segs, x0, y0, cell, nx, ny):
+    """線分を細分化し、各セルでの工具先端の最低Z (未通過セルは +inf) を返す。"""
+    field = np.full((ny, nx), np.inf)
+    if len(segs) == 0:
+        return field
+    p0, p1 = segs[:, :3], segs[:, 3:]
+    length = np.hypot(p1[:, 0] - p0[:, 0], p1[:, 1] - p0[:, 1])
+    n = np.maximum(1, np.ceil(length / (cell * 0.5)).astype(int))
+    idx = np.repeat(np.arange(len(segs)), n + 1)
+    starts = np.repeat(np.cumsum(n + 1) - (n + 1), n + 1)
+    t = (np.arange(len(idx)) - starts) / np.repeat(n, n + 1)
+    pts = p0[idx] + (p1[idx] - p0[idx]) * t[:, None]
+    ix = np.round((pts[:, 0] - x0) / cell).astype(int)
+    iy = np.round((pts[:, 1] - y0) / cell).astype(int)
+    ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+    np.minimum.at(field, (iy[ok], ix[ok]), pts[ok, 2])
+    return field
+
+def cut_with_tool(height, centers, cell, radius, v_angle=None):
+    """工具先端の軌跡フィールドを工具形状で膨らませ (グレースケール収縮)、材料面に反映する。
+    v_angle=None ならフラットエンドミル、角度指定ならVビット。"""
+    if not np.isfinite(centers).any():
+        return height
+    k = max(1, int(math.ceil(radius / cell)))
+    dy, dx = np.mgrid[-k:k + 1, -k:k + 1] * cell
+    d = np.hypot(dx, dy)
+    footprint = d <= max(radius, cell * 0.5)
+    profile = np.zeros_like(d) if v_angle is None else d / np.tan(np.radians(v_angle / 2.0))
+    big = 1e6
+    eroded = grey_erosion(np.where(np.isfinite(centers), centers, big),
+                          footprint=footprint, structure=-profile, mode='constant', cval=big)
+    return np.minimum(height, eroded)
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def simulate_stock(jobs, bounds, cell):
+    """jobs: (gcode, 工具種別, 工具径, V角度) のタプル。上面 Z=0 の材料を削ったハイトマップを返す。"""
+    minx, miny, maxx, maxy = bounds
+    nx = int(math.ceil((maxx - minx) / cell)) + 1
+    ny = int(math.ceil((maxy - miny) / cell)) + 1
+    height = np.zeros((ny, nx))
+    rapid_hits = 0
+    for gcode, kind, dia, angle in jobs:
+        segs, hits = parse_gcode_moves(gcode)
+        rapid_hits += hits
+        if len(segs) == 0:
+            continue
+        centers = tool_center_field(segs, minx, miny, cell, nx, ny)
+        if kind == 'vbit':
+            # Vビットは最深点での切削半径まで考慮する
+            depth = max(0.0, -float(np.min(segs[:, [2, 5]])))
+            radius = depth * np.tan(np.radians(angle / 2.0))
+            height = cut_with_tool(height, centers, cell, radius, angle)
+        else:
+            height = cut_with_tool(height, centers, cell, dia / 2.0)
+    height = np.minimum(height, 0.0)
+    xs = minx + np.arange(nx) * cell
+    ys = miny + np.arange(ny) * cell
+    return xs, ys, height, rapid_hits
+
+def make_preview_figure(xs, ys, height, thickness):
+    z = height.copy()
+    z[z <= -thickness + 1e-6] = np.nan  # 貫通部は穴として表示
+    fig = go.Figure(go.Surface(
+        x=xs, y=ys, z=z, cmin=-thickness, cmax=0.0,
+        colorscale=[[0.0, '#5b3a1a'], [0.6, '#b07a3e'], [1.0, '#e8c48f']],
+        colorbar=dict(title='Z (mm)', thickness=12),
+        lighting=dict(ambient=0.45, diffuse=0.8, specular=0.15, roughness=0.8),
+        lightposition=dict(x=100, y=200, z=1000),
+        contours=dict(z=dict(show=False)),
+        hovertemplate='X %{x:.2f}<br>Y %{y:.2f}<br>Z %{z:.2f}<extra></extra>'))
+    span = max(xs[-1] - xs[0], ys[-1] - ys[0], 1e-6)
+    fig.update_layout(
+        height=600, margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(
+            aspectmode='manual',
+            aspectratio=dict(x=(xs[-1] - xs[0]) / span, y=(ys[-1] - ys[0]) / span,
+                             z=max(0.08, min(1.0, thickness / span * 2))),
+            xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
+            zaxis=dict(range=[-thickness, 0.5]),
+            camera=dict(eye=dict(x=0.6, y=-1.0, z=0.8))))
+    return fig
+
 # --- 3. UIロジック ---
 
 st.set_page_config(page_title="yosikeiCAM", layout="wide")
@@ -440,7 +580,7 @@ with st.sidebar:
     T = LANG_DICT[lang]
 
 st.title(T["title"])
-st.caption("Ver 4.5: Name Change and High Stability")
+st.caption("Ver 4.6: 3D Machining Preview")
 
 with st.sidebar:
     st.header(T["origin_setting"])
@@ -506,6 +646,12 @@ with st.sidebar:
     pp = POST_PROCESSORS[ppn]
     h_c = st.text_area("Header", pp["start"])
     f_c = st.text_area("Footer", pp["end"])
+
+    st.divider()
+    st.header(T["preview_header"])
+    show_3d = st.checkbox(T["preview_enable"], value=True, key="p3d")
+    stock_t = st.number_input(T["stock_thickness"], value=10.0, min_value=0.1, step=1.0)
+    sim_res = st.select_slider(T["sim_resolution"], options=[0.05, 0.1, 0.2, 0.3, 0.5], value=0.2)
 
 st.header(T["dxf_upload"])
 f = st.file_uploader("", type=["dxf"])
@@ -612,5 +758,27 @@ if f:
             if gc_p: dl_c2.download_button(T["download"][1], gc_p, f"{bn}_pocket.nc")
             if gc_c: dl_c1.download_button(T["download"][2], gc_c, f"{bn}_chamfer.nc")
             if gc_d: dl_c2.download_button(T["download"][3], gc_d, f"{bn}_drill.nc")
+
+        if show_3d:
+            st.header(T["preview_header"])
+            jobs = []
+            if gc_p: jobs.append((gc_p, 'flat', dia, 0.0))
+            if gc_d: jobs.append((gc_d, 'flat', ddt, 0.0))
+            if gc_c: jobs.append((gc_c, 'vbit', 0.0, 90.0))
+            if gc_v: jobs.append((gc_v, 'vbit', 0.0, va))
+            if jobs:
+                bx0, by0, bx1, by1 = unary_union(polys_moved).bounds
+                margin = max(5.0, dia / 2 + 2.0, ddt / 2 + 2.0, abs(z_c) + 2.0)
+                sim_bounds = (bx0 - margin, by0 - margin, bx1 + margin, by1 + margin)
+                # 大きな図面ではセル数が増えすぎないように解像度を自動で粗くする
+                cell = max(sim_res, max(sim_bounds[2] - sim_bounds[0], sim_bounds[3] - sim_bounds[1]) / 800)
+                with st.spinner(T["preview_running"]):
+                    xs, ys, hmap, rapid_hits = simulate_stock(tuple(jobs), sim_bounds, cell)
+                if rapid_hits:
+                    st.warning(T["rapid_warning"].format(n=rapid_hits))
+                st.plotly_chart(make_preview_figure(xs, ys, hmap, stock_t), use_container_width=True)
+                st.caption(T["preview_note"] + f" (cell {cell:.2f} mm)")
+            else:
+                st.info(T["preview_none"])
     else:
         st.error(T["error_no_geom"])
