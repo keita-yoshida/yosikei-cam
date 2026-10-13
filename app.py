@@ -68,6 +68,7 @@ LANG_DICT = {
         "preview_running": "加工シミュレーション中...",
         "preview_none": "プレビューするパスがありません。",
         "rapid_warning": "早送り(G0)で材料内をXY移動している箇所が {n} 件あります。",
+        "feed_warning": "送り速度 F{f} が機械の最大切削送り {m} mm/min を超えています。",
         "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット)。"
     },
     "English": {
@@ -114,6 +115,7 @@ LANG_DICT = {
         "preview_running": "Simulating material removal...",
         "preview_none": "No toolpaths to preview.",
         "rapid_warning": "{n} rapid (G0) XY move(s) run inside the stock.",
+        "feed_warning": "Feed F{f} exceeds the machine's max cutting feed of {m} mm/min.",
         "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat)."
     }
 }
@@ -123,6 +125,7 @@ LANG_DICT = {
 # comment : コメント形式 (";" または Fanuc 系の "()")
 # tool_change : T1 M06 を出力するか (ATC なしの機械では False)
 # canned_drill: ドリルを G81/G83 固定サイクルで出力するか
+# max_feed: 機械の最大切削送り (mm/min)。超える設定には警告を出す (省略時はチェックしない)
 POST_PROCESSORS = {
     "Generic (汎用)": {
         "start": "G21 ; Metric\nG90 ; Absolute\nG00 Z10.0 ; Safe Z\nM3 S10000 ; Spindle On",
@@ -139,10 +142,14 @@ POST_PROCESSORS = {
         "end": "M05\nG00 Z10.0\nM30",
         "format": "G00/G01", "comment": ";", "tool_change": True, "canned_drill": False
     },
+    # 牧野 AVNC-74 (FANUC 0M) 取扱説明書に合わせた設定:
+    # 主軸回転数はペンダントの変速ダイヤルと高低速レバーで手動設定するため S コードは出さない。
+    # 使える M コードは M00-05, M07-09, M21-23, M30, M48, M49, M98, M99。切削送りは最大 2400mm/min。
     "Fanuc 0M (ATCなし)": {
-        "start": "%\nO0001 (YOSIKEICAM)\nG17 G21 G40 G49 G80 G90\nG54\nG00 Z10.\nM03 S5000",
+        "start": "%\nO0001 (YOSIKEICAM)\nG17 G21 G40 G49 G80 G90\nG54\nG00 Z10.\n(SET SPINDLE SPEED WITH DIAL)\nM03",
         "end": "M05\nG91 G28 Z0.\nG90\nM30\n%",
-        "format": "G00/G01", "comment": "()", "tool_change": False, "canned_drill": True
+        "format": "G00/G01", "comment": "()", "tool_change": False, "canned_drill": True,
+        "max_feed": 2400
     }
 }
 
@@ -974,6 +981,11 @@ if f:
             if gc_p: dl_c2.download_button(T["download"][1], gc_p, f"{bn}_pocket.nc")
             if gc_c: dl_c1.download_button(T["download"][2], gc_c, f"{bn}_chamfer.nc")
             if gc_d: dl_c2.download_button(T["download"][3], gc_d, f"{bn}_drill.nc")
+            max_feed = pp.get("max_feed")
+            if max_feed:
+                used = {int(v) for gc in (gc_v, gc_p, gc_c, gc_d) if gc for v in re.findall(r'F(\d+)', gc)}
+                for fv_used in sorted(v for v in used if v > max_feed):
+                    st.warning(T["feed_warning"].format(f=fv_used, m=max_feed))
             # 内蔵メモリ運転の目安になるよう、各ファイルのサイズを表示する
             for name, gc in (("VCARVE", gc_v), ("POCKET", gc_p), ("CHAMFER", gc_c), ("DRILL", gc_d)):
                 if gc:
