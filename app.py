@@ -78,7 +78,7 @@ LANG_DICT = {
         "preview_none": "プレビューするパスがありません。",
         "rapid_warning": "早送り(G0)で材料内をXY移動している箇所が {n} 件あります。",
         "feed_warning": "送り速度 F{f} が機械の最大切削送り {m} mm/min を超えています。",
-        "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット, 線彫り=選んだ工具)。"
+        "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット, 線彫り=選んだ工具)。灰色は材料を貫通した部分です。"
     },
     "English": {
         "title": "yosikeiCAM 4.7",
@@ -134,7 +134,7 @@ LANG_DICT = {
         "preview_none": "No toolpaths to preview.",
         "rapid_warning": "{n} rapid (G0) XY move(s) run inside the stock.",
         "feed_warning": "Feed F{f} exceeds the machine's max cutting feed of {m} mm/min.",
-        "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat, Engrave = chosen tool)."
+        "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat, Engrave = chosen tool). Grey marks where the cut goes through the stock."
     }
 }
 
@@ -918,16 +918,32 @@ def simulate_stock(jobs, bounds, cell):
     return xs, ys, height, rapid_hits
 
 def make_preview_figure(xs, ys, height, thickness):
-    z = height.copy()
-    z[z <= -thickness + 1e-6] = np.nan  # 貫通部は穴として表示
-    fig = go.Figure(go.Surface(
-        x=xs, y=ys, z=z, cmin=-thickness, cmax=0.0,
-        colorscale=[[0.0, '#5b3a1a'], [0.6, '#b07a3e'], [1.0, '#e8c48f']],
+    # 材料の底より深い部分は底で止め (壁が底まで描かれる)、貫通した所は灰色で示す
+    z = np.maximum(height, -thickness)
+    through = height <= -thickness + 1e-6
+    d = thickness * 0.03
+    color = np.where(through, -thickness - d, z)
+    k = d / (thickness + d)
+    wood = [[0.0, '#5b3a1a'], [0.6, '#b07a3e'], [1.0, '#e8c48f']]
+    colorscale = [[0.0, '#8d939a'], [k * 0.999, '#8d939a']] + [[k + (1 - k) * p, c] for p, c in wood]
+    surface = go.Surface(
+        x=xs, y=ys, z=z, surfacecolor=color, cmin=-thickness - d, cmax=0.0,
+        colorscale=colorscale,
         colorbar=dict(title='Z (mm)', thickness=12),
         lighting=dict(ambient=0.45, diffuse=0.8, specular=0.15, roughness=0.8),
         lightposition=dict(x=100, y=200, z=1000),
         contours=dict(z=dict(show=False)),
-        hovertemplate='X %{x:.2f}<br>Y %{y:.2f}<br>Z %{z:.2f}<extra></extra>'))
+        hovertemplate='X %{x:.2f}<br>Y %{y:.2f}<br>Z %{z:.2f}<extra></extra>')
+    # 材料ブロックの側面 (上端はハイトマップの外周に合わせる)
+    sides = []
+    for ex, ey, ez in ((xs, np.full_like(xs, ys[0]), z[0, :]), (xs, np.full_like(xs, ys[-1]), z[-1, :]),
+                       (np.full_like(ys, xs[0]), ys, z[:, 0]), (np.full_like(ys, xs[-1]), ys, z[:, -1])):
+        sides.append(go.Surface(
+            x=np.vstack([ex, ex]), y=np.vstack([ey, ey]), z=np.vstack([np.full_like(ez, -thickness), ez]),
+            surfacecolor=np.zeros((2, len(ex))), colorscale=[[0, '#c9995e'], [1, '#c9995e']],
+            showscale=False, hoverinfo='skip',
+            lighting=dict(ambient=0.6, diffuse=0.6, specular=0.05, roughness=0.9)))
+    fig = go.Figure([surface] + sides)
     span = max(xs[-1] - xs[0], ys[-1] - ys[0], 1e-6)
     fig.update_layout(
         height=600, margin=dict(l=0, r=0, t=10, b=0),
@@ -936,7 +952,7 @@ def make_preview_figure(xs, ys, height, thickness):
             aspectratio=dict(x=(xs[-1] - xs[0]) / span, y=(ys[-1] - ys[0]) / span,
                              z=max(0.08, min(1.0, thickness / span * 2))),
             xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
-            zaxis=dict(range=[-thickness, 0.5]),
+            zaxis=dict(range=[-thickness - 0.5, 0.5]),
             camera=dict(eye=dict(x=0.6, y=-1.0, z=0.8))))
     return fig
 
