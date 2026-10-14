@@ -50,7 +50,9 @@ LANG_DICT = {
         "drill_depth": "深さ Z",
         "peck": "ペック量",
         "feed": "送り速度",
-        "post_processor": "スタートコード/エンドコード",
+        "post_processor": "NC装置 (ポストプロセッサ)",
+        "start_code": "スタートコード",
+        "end_code": "エンドコード",
         "dxf_upload": "DXFアップロード",
         "path_select": "パス選択",
         "select_all": "すべて選択",
@@ -106,7 +108,9 @@ LANG_DICT = {
         "drill_depth": "Depth Z",
         "peck": "Peck Amount",
         "feed": "Feed Rate",
-        "post_processor": "Start Code / End Code",
+        "post_processor": "NC Control (Post Processor)",
+        "start_code": "Start Code",
+        "end_code": "End Code",
         "dxf_upload": "DXF Upload",
         "path_select": "Path Selection",
         "select_all": "Select All",
@@ -1052,8 +1056,8 @@ with st.sidebar:
     st.divider()
     ppn = st.selectbox(T["post_processor"], list(POST_PROCESSORS.keys()))
     pp = POST_PROCESSORS[ppn]
-    h_c = st.text_area("Header", pp["start"])
-    f_c = st.text_area("Footer", pp["end"])
+    h_c = st.text_area(T["start_code"], pp["start"])
+    f_c = st.text_area(T["end_code"], pp["end"])
     out_tol = st.number_input(T["out_tol"], value=0.01, min_value=0.001, max_value=0.1, step=0.005, format="%.3f")
 
     st.divider()
