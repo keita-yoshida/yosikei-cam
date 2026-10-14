@@ -18,7 +18,7 @@ import ezdxf
 import ezdxf.path
 
 # Vカービング用
-from scipy.spatial import Voronoi
+from scipy.spatial import Voronoi, cKDTree
 # 3Dプレビュー用
 from scipy.ndimage import grey_erosion
 
@@ -198,6 +198,59 @@ def douglas_peucker(points, tolerance):
     else:
         return [points[0], points[end]]
 
+def _to_polygons(pts):
+    """点列から有効なポリゴンのリストを作る (自己交差は修復する)。"""
+    if len(pts) < 3:
+        return []
+    poly = Polygon(pts)
+    if poly.is_valid:
+        return [poly] if poly.area > 0.0001 else []
+    return [p for p in ensure_list_of_polys(make_valid(poly)) if p.area > 0.0001]
+
+def join_open_paths(paths, tol=0.01):
+    """端点が tol 以内で接する開いた線 (ARC/LINE など) をつなぎ、閉じた輪郭の点列を返す。
+    paths: [(点列, 単独でも閉じてよいか)]。閉じなかった線の本数も返す。"""
+    if not paths:
+        return [], 0
+    ends = np.array([p[0][i] for p in paths for i in (0, -1)], dtype=float)
+    # 近い端点を同じノードにまとめる
+    node = -np.ones(len(ends), dtype=int)
+    tree = cKDTree(ends)
+    for i in range(len(ends)):
+        if node[i] < 0:
+            node[tree.query_ball_point(ends[i], tol)] = i
+    adj = {}
+    for k in range(len(paths)):
+        for n in (node[2 * k], node[2 * k + 1]):
+            adj.setdefault(n, []).append(k)
+    used, loops, dropped = set(), [], 0
+    for start in range(len(paths)):
+        if start in used:
+            continue
+        used.add(start)
+        chain = list(paths[start][0])
+        head, tail = node[2 * start], node[2 * start + 1]
+        members = [start]
+        # 末尾方向に、分岐のないノードを伝ってつなげていく
+        while tail != head and len(adj[tail]) == 2:
+            nxt = next((k for k in adj[tail] if k not in used), None)
+            if nxt is None:
+                break
+            used.add(nxt)
+            members.append(nxt)
+            pts = paths[nxt][0]
+            if node[2 * nxt] == tail:
+                chain.extend(pts[1:]); tail = node[2 * nxt + 1]
+            else:
+                chain.extend(pts[-2::-1]); tail = node[2 * nxt]
+        if tail == head and len(chain) > 3:
+            loops.append(chain)
+        elif len(members) == 1 and paths[start][1]:
+            loops.append(chain)  # 単独の開いたポリラインは従来どおり自動で閉じる
+        else:
+            dropped += len(members)
+    return loops, dropped
+
 def dxf_to_shapely_list(dxf_bytes):
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
         tmp.write(dxf_bytes)
@@ -205,27 +258,31 @@ def dxf_to_shapely_list(dxf_bytes):
     try:
         doc = ezdxf.readfile(tmp_path)
         msp = doc.modelspace()
-        polys = []
+        polys, open_paths = [], []
         for e in msp:
-            if e.dxftype() in ('LWPOLYLINE', 'POLYLINE', 'SPLINE', 'CIRCLE'):
-                try:
-                    if e.dxftype() == 'CIRCLE':
-                        poly = Point(e.dxf.center.x, e.dxf.center.y).buffer(e.dxf.radius, resolution=64)
-                    else:
-                        p_obj = ezdxf.path.make_path(e)
-                        pts = list(p_obj.flattening(0.01))
-                        poly = Polygon([(v.x, v.y) for v in pts]) if len(pts) > 2 else None
-                    if poly and poly.is_valid and poly.area > 0.0001:
-                        polys.append(poly)
-                    elif poly:
-                        clean = make_valid(poly)
-                        if clean.area > 0.0001:
-                            if clean.geom_type == 'Polygon':
-                                polys.append(clean)
-                            else:
-                                polys.extend(clean.geoms)
-                except:
-                    pass
+            kind = e.dxftype()
+            if kind not in ('LWPOLYLINE', 'POLYLINE', 'SPLINE', 'CIRCLE', 'ARC', 'LINE', 'ELLIPSE'):
+                continue
+            try:
+                if kind == 'CIRCLE':
+                    # 法線が -Z の円 (Rhino 等) は OCS→WCS 変換しないと X が反転する
+                    c = e.ocs().to_wcs(e.dxf.center)
+                    polys.append(Point(c.x, c.y).buffer(e.dxf.radius, resolution=64))
+                    continue
+                pts = [(v.x, v.y) for v in ezdxf.path.make_path(e).flattening(0.01)]
+                if len(pts) < 2:
+                    continue
+                if len(pts) > 3 and math.dist(pts[0], pts[-1]) < 1e-6:
+                    polys.extend(_to_polygons(pts))
+                else:
+                    open_paths.append((pts, kind in ('LWPOLYLINE', 'POLYLINE', 'SPLINE')))
+            except Exception:
+                pass
+        loops, dropped = join_open_paths(open_paths)
+        for pts in loops:
+            polys.extend(_to_polygons(pts))
+        if dropped:
+            st.warning(f"閉じていない線が {dropped} 本あり、無視しました。 / {dropped} open segment(s) could not be joined and were ignored.")
         polys.sort(key=lambda x: x.area, reverse=True)
         return polys
     except Exception as e:
