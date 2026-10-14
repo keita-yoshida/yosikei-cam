@@ -50,7 +50,7 @@ LANG_DICT = {
         "drill_depth": "深さ Z",
         "peck": "ペック量",
         "feed": "送り速度",
-        "post_processor": "スタートコード/エンコード",
+        "post_processor": "スタートコード/エンドコード",
         "dxf_upload": "DXFアップロード",
         "path_select": "パス選択",
         "select_all": "すべて選択",
