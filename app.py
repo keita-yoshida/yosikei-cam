@@ -9,7 +9,7 @@ import re
 from collections import Counter
 
 # 幾何学計算ライブラリ
-from shapely.geometry import Polygon, LineString, Point, MultiPolygon, GeometryCollection
+from shapely.geometry import Polygon, LineString, Point, MultiPolygon, MultiLineString, GeometryCollection
 from shapely.affinity import translate
 from shapely.ops import linemerge, unary_union
 from shapely.validation import make_valid
@@ -25,11 +25,11 @@ from scipy.ndimage import grey_erosion
 # --- 0. 多言語定義 (辞書) ---
 LANG_DICT = {
     "Japanese": {
-        "title": "yosikeiCAM 4.6",
+        "title": "yosikeiCAM 4.7",
         "origin_setting": "原点設定",
         "origin_option": ["左下 (Bottom-Left)", "中心 (Center)", "CAD座標 (Original)"],
         "process_setting": "加工設定",
-        "tabs": ["ポケット", "面取り", "Vカーブ", "ドリル"],
+        "tabs": ["ポケット", "面取り", "Vカーブ", "ドリル", "線彫り"],
         "enable": "有効",
         "tool_dia": "工具径 (mm)",
         "double_pass": "2回加工 (粗+仕上げ)",
@@ -56,10 +56,19 @@ LANG_DICT = {
         "select_all": "すべて選択",
         "size_display": "加工サイズ",
         "gen_header": "パス生成",
-        "download": ["VCARVE 保存", "POCKET 保存", "CHAMFER 保存", "DRILL 保存"],
+        "download": ["VCARVE 保存", "POCKET 保存", "CHAMFER 保存", "DRILL 保存", "ENGRAVE 保存", "POCKET残り削り 保存"],
         "error_no_geom": "図形が見つかりません。",
         "hole_detected": "検出された円",
         "out_tol": "出力公差 (円弧・直線近似, mm)",
+        "rest_machining": "残り削り (小径工具・別ファイル)",
+        "rest_tool_dia": "小径工具径 (mm)",
+        "unreachable": "工具が届かず削れない領域が約 {a:.1f} mm² あります (3Dプレビューで確認できます)。",
+        "engrave_help": "開いた線 (と必要なら輪郭) の上を工具中心でなぞって彫ります。",
+        "engrave_tool": ["Vビット", "フラットエンドミル"],
+        "engrave_depth": "彫り深さ Z",
+        "engrave_closed": "選択した閉じた輪郭の線も彫る",
+        "line_width": "線幅 約 {w:.2f} mm",
+        "open_line": "線",
         "file_size": "{name}: {kb:.1f} KB / {lines} 行",
         "preview_header": "3D 加工プレビュー",
         "preview_enable": "3Dプレビューを表示",
@@ -69,14 +78,14 @@ LANG_DICT = {
         "preview_none": "プレビューするパスがありません。",
         "rapid_warning": "早送り(G0)で材料内をXY移動している箇所が {n} 件あります。",
         "feed_warning": "送り速度 F{f} が機械の最大切削送り {m} mm/min を超えています。",
-        "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット)。"
+        "preview_note": "Gコードを読み直して工具形状で削った結果です (Vカーブ/面取り=Vビット, ポケット/ドリル=フラット, 線彫り=選んだ工具)。"
     },
     "English": {
-        "title": "yosikeiCAM 4.6",
+        "title": "yosikeiCAM 4.7",
         "origin_setting": "Origin Setup",
         "origin_option": ["Bottom-Left", "Center", "Original (CAD)"],
         "process_setting": "Machining Setup",
-        "tabs": ["Pocket", "Chamfer", "V-Carve", "Drill"],
+        "tabs": ["Pocket", "Chamfer", "V-Carve", "Drill", "Engrave"],
         "enable": "Enable",
         "tool_dia": "Tool Dia (mm)",
         "double_pass": "Double Pass (Rough+Finish)",
@@ -103,10 +112,19 @@ LANG_DICT = {
         "select_all": "Select All",
         "size_display": "Machining Size",
         "gen_header": "Toolpath Generation",
-        "download": ["Save VCARVE", "Save POCKET", "Save CHAMFER", "Save DRILL"],
+        "download": ["Save VCARVE", "Save POCKET", "Save CHAMFER", "Save DRILL", "Save ENGRAVE", "Save POCKET REST"],
         "error_no_geom": "No valid geometry found.",
         "hole_detected": "Circles detected",
         "out_tol": "Output Tolerance (arc/line fitting, mm)",
+        "rest_machining": "Rest machining (small tool, separate file)",
+        "rest_tool_dia": "Small Tool Dia (mm)",
+        "unreachable": "About {a:.1f} mm² cannot be reached by the tools (see the 3D preview).",
+        "engrave_help": "Cuts along open lines (and optionally outlines) with the tool center on the line.",
+        "engrave_tool": ["V-bit", "Flat end mill"],
+        "engrave_depth": "Engrave Depth Z",
+        "engrave_closed": "Also engrave selected closed outlines",
+        "line_width": "Line width approx. {w:.2f} mm",
+        "open_line": "Line",
         "file_size": "{name}: {kb:.1f} KB / {lines} lines",
         "preview_header": "3D Machining Preview",
         "preview_enable": "Show 3D preview",
@@ -116,7 +134,7 @@ LANG_DICT = {
         "preview_none": "No toolpaths to preview.",
         "rapid_warning": "{n} rapid (G0) XY move(s) run inside the stock.",
         "feed_warning": "Feed F{f} exceeds the machine's max cutting feed of {m} mm/min.",
-        "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat)."
+        "preview_note": "Simulated from the generated G-code with the tool shape (V-Carve/Chamfer = V-bit, Pocket/Drill = flat, Engrave = chosen tool)."
     }
 }
 
@@ -208,11 +226,11 @@ def _to_polygons(pts):
     return [p for p in ensure_list_of_polys(make_valid(poly)) if p.area > 0.0001]
 
 def join_open_paths(paths, tol=0.01):
-    """端点が tol 以内で接する開いた線 (ARC/LINE など) をつなぎ、閉じた輪郭の点列を返す。
-    paths: [(点列, 単独でも閉じてよいか)]。閉じなかった線の本数も返す。"""
+    """端点が tol 以内で接する開いた線 (ARC/LINE など) をつなぐ。
+    閉じた輪郭の点列のリストと、閉じなかった (開いたままの) 線の点列のリストを返す。"""
     if not paths:
-        return [], 0
-    ends = np.array([p[0][i] for p in paths for i in (0, -1)], dtype=float)
+        return [], []
+    ends = np.array([p[i] for p in paths for i in (0, -1)], dtype=float)
     # 近い端点を同じノードにまとめる
     node = -np.ones(len(ends), dtype=int)
     tree = cKDTree(ends)
@@ -223,33 +241,35 @@ def join_open_paths(paths, tol=0.01):
     for k in range(len(paths)):
         for n in (node[2 * k], node[2 * k + 1]):
             adj.setdefault(n, []).append(k)
-    used, loops, dropped = set(), [], 0
-    for start in range(len(paths)):
+    deg = lambda n: len(adj[n])
+    # 開いた線は端 (分岐のないノードでない側) から辿り始めると途中で分断されない
+    order = sorted(range(len(paths)),
+                   key=lambda k: 0 if deg(node[2 * k]) != 2 or deg(node[2 * k + 1]) != 2 else 1)
+    used, loops, chains = set(), [], []
+    for start in order:
         if start in used:
             continue
         used.add(start)
-        chain = list(paths[start][0])
+        chain = list(paths[start])
         head, tail = node[2 * start], node[2 * start + 1]
-        members = [start]
-        # 末尾方向に、分岐のないノードを伝ってつなげていく
-        while tail != head and len(adj[tail]) == 2:
+        if deg(head) == 2 and deg(tail) != 2:
+            chain.reverse()
+            head, tail = tail, head
+        while tail != head and deg(tail) == 2:
             nxt = next((k for k in adj[tail] if k not in used), None)
             if nxt is None:
                 break
             used.add(nxt)
-            members.append(nxt)
-            pts = paths[nxt][0]
+            pts = paths[nxt]
             if node[2 * nxt] == tail:
                 chain.extend(pts[1:]); tail = node[2 * nxt + 1]
             else:
                 chain.extend(pts[-2::-1]); tail = node[2 * nxt]
         if tail == head and len(chain) > 3:
             loops.append(chain)
-        elif len(members) == 1 and paths[start][1]:
-            loops.append(chain)  # 単独の開いたポリラインは従来どおり自動で閉じる
         else:
-            dropped += len(members)
-    return loops, dropped
+            chains.append(chain)
+    return loops, chains
 
 def dxf_to_shapely_list(dxf_bytes):
     with tempfile.NamedTemporaryFile(suffix='.dxf', delete=False) as tmp:
@@ -275,19 +295,19 @@ def dxf_to_shapely_list(dxf_bytes):
                 if len(pts) > 3 and math.dist(pts[0], pts[-1]) < 1e-6:
                     polys.extend(_to_polygons(pts))
                 else:
-                    open_paths.append((pts, kind in ('LWPOLYLINE', 'POLYLINE', 'SPLINE')))
+                    open_paths.append(pts)
             except Exception:
                 pass
-        loops, dropped = join_open_paths(open_paths)
+        loops, chains = join_open_paths(open_paths)
         for pts in loops:
             polys.extend(_to_polygons(pts))
-        if dropped:
-            st.warning(f"閉じていない線が {dropped} 本あり、無視しました。 / {dropped} open segment(s) could not be joined and were ignored.")
+        lines = [LineString(c) for c in chains if LineString(c).length > 0.01]
         polys.sort(key=lambda x: x.area, reverse=True)
-        return polys
+        lines.sort(key=lambda x: x.length, reverse=True)
+        return polys, lines
     except Exception as e:
         st.error(f"DXF Read Error: {e}")
-        return []
+        return [], []
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -399,7 +419,7 @@ def _arc_fit(pts, i, j, tol):
     if center is None:
         return None
     r = np.hypot(*(seg[0] - center))
-    if r > 2000.0 or r < 0.05:
+    if r > 500.0 or r < 0.05:  # ほぼ直線の巨大円弧は直線で出す
         return None
     if np.max(np.abs(np.hypot(*(seg - center).T) - r)) > tol:
         return None
@@ -511,31 +531,102 @@ def generate_drill_gcode(points, z_start, z_final, peck_depth, feed, tool_name, 
     w.raw(footer)
     return w.text()
 
-def generate_pocket(geometry, tool_d, clearance, stepover):
-    paths_rough, paths_finish = [], []
-    r, step = tool_d / 2.0, tool_d * stepover
-    offset_rough = -(r + clearance)
-    try:
-        current_rough = geometry.buffer(offset_rough, join_style=2)
-    except:
-        current_rough = Polygon()
-    while not current_rough.is_empty and current_rough.area > 0.01:
-        for p in ensure_list_of_polys(current_rough):
-            paths_rough.append(p.exterior)
-            paths_rough.extend(p.interiors)
+def _center_loops(region, step, min_area=0.01):
+    """工具中心が動ける領域を外周から step ずつ内側へオフセットした輪郭の列。"""
+    loops, cur = [], region
+    while cur is not None and not cur.is_empty and cur.area > min_area:
+        for p in ensure_list_of_polys(cur):
+            loops.append(p.exterior)
+            loops.extend(p.interiors)
         try:
-            current_rough = current_rough.buffer(-step, join_style=2)
-        except:
+            cur = cur.buffer(-step, join_style=2)
+        except Exception:
             break
+    return [LineString(l.coords) for l in loops if l.length > 0.1]
+
+def swept_area(paths, r):
+    """工具半径 r でパスをなぞったときに削れる範囲。"""
+    lines = [list(p.coords) for p in paths if len(p.coords) > 1]
+    return MultiLineString(lines).buffer(r, quad_segs=8) if lines else Polygon()
+
+def _cleanup_loops(target, centers, paths, r, step, rounds=3):
+    """target のうち paths で削れていない部分を探し、そこへ届く追加パスを返す (取り残し対策)。"""
+    extra = []
+    for _ in range(rounds):
+        rest = target.difference(swept_area(paths + extra, r))
+        pieces = [q for q in ensure_list_of_polys(rest) if q.area > 0.001]
+        if not pieces:
+            break
+        added = []
+        for q in pieces:
+            # 取り残しに食い込める工具中心の範囲を、外周と内側オフセットでなぞる
+            reach = centers.intersection(q.buffer(r * 0.95))
+            for p in ensure_list_of_polys(reach):
+                added.append(LineString(p.exterior.coords))
+            added += _center_loops(reach.buffer(-step, join_style=2), step)
+        added = [l for l in added if l.length > 0.05]
+        if not added:
+            break
+        extra += added
+    return extra
+
+def generate_pocket(geometry, tool_d, clearance, stepover):
+    paths_finish = []
+    r, step = tool_d / 2.0, tool_d * stepover
+    try:
+        centers = geometry.buffer(-(r + clearance), join_style=2)
+    except Exception:
+        centers = Polygon()
+    paths_rough = _center_loops(centers, step)
+    if paths_rough:
+        # 工具が届く範囲 (仕上げ代を残す) を全部削れているか確認し、取り残しがあれば追加パスで削る。
+        # 届く範囲は丸い工具そのものなので、ここは角を丸めたオフセットで求める
+        reach_centers = geometry.buffer(-(r + clearance), join_style=1)
+        target = reach_centers.buffer(r, join_style=1).buffer(-0.02)
+        paths_rough += _cleanup_loops(target, reach_centers, paths_rough, r, step)
     if clearance > 0:
         try:
             for p in ensure_list_of_polys(geometry.buffer(-r, join_style=2)):
                 paths_finish.append(p.exterior)
                 paths_finish.extend(p.interiors)
-        except:
+        except Exception:
             pass
-    return ([LineString(p.coords) for p in paths_rough if p.length > 0.1], 
-            [LineString(p.coords) for p in paths_finish if p.length > 0.1])
+    return paths_rough, [LineString(p.coords) for p in paths_finish if p.length > 0.1]
+
+def generate_rest_pocket(geometry, big_paths, big_d, small_d, clearance, stepover):
+    """大径工具で届かなかった部分だけを小径工具で削るパス (残り削り)。"""
+    rs, step = small_d / 2.0, small_d * stepover
+    try:
+        centers = geometry.buffer(-(rs + clearance), join_style=1)
+        target = centers.buffer(rs, join_style=1).buffer(-0.02)
+        rest = target.difference(swept_area(big_paths, big_d / 2.0))
+    except Exception:
+        return []
+    pieces = [q for q in ensure_list_of_polys(rest) if q.area > 0.001]
+    if not pieces:
+        return []
+    region = centers.intersection(unary_union(pieces).buffer(rs * 0.95))
+    paths = _center_loops(region, step)
+    paths += _cleanup_loops(unary_union(pieces), centers, paths, rs, step)
+    return paths
+
+def order_paths(paths, start=(0.0, 0.0)):
+    """早送りが短くなるよう、近い順に並べ替える (開いた線は向きも反転して近い端から入る)。"""
+    remaining, ordered, cur = list(paths), [], np.array(start)
+    while remaining:
+        best, best_d, best_rev = 0, float('inf'), False
+        for i, p in enumerate(remaining):
+            c = p.coords
+            d0 = np.hypot(*(np.array(c[0][:2]) - cur))
+            d1 = np.inf if p.is_ring else np.hypot(*(np.array(c[-1][:2]) - cur))
+            if d0 < best_d: best, best_d, best_rev = i, d0, False
+            if d1 < best_d: best, best_d, best_rev = i, d1, True
+        p = remaining.pop(best)
+        if best_rev:
+            p = LineString(list(p.coords)[::-1])
+        ordered.append(p)
+        cur = np.array(p.coords[-1][:2])
+    return ordered
 
 def generate_chamfer_separated(geometry, tip_offset, finish_allowance=0.0):
     rough_paths, finish_paths = [], []
@@ -859,14 +950,14 @@ with st.sidebar:
     T = LANG_DICT[lang]
 
 st.title(T["title"])
-st.caption("Ver 4.6: 3D Machining Preview")
+st.caption("Ver 4.7: Engraving & Rest Machining")
 
 with st.sidebar:
     st.header(T["origin_setting"])
     origin = st.radio("", T["origin_option"], index=0)
     st.divider()
     st.header(T["process_setting"])
-    tab1, tab2, tab3, tab4 = st.tabs(T["tabs"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(T["tabs"])
     
     with tab1:
         enable_p = st.checkbox(T["enable"], value=True, key="cp")
@@ -885,6 +976,12 @@ with st.sidebar:
         c3, c4 = st.columns(2)
         with c3: dep_p = st.number_input(T["final_depth"], value=-1.0, step=0.1)
         with c4: stp_p = st.number_input(T["pitch"], value=1.0, min_value=0.01)
+        urp = st.checkbox(T["rest_machining"], value=False, key="urp")
+        if urp:
+            c7, c8 = st.columns(2)
+            with c7: rdia = st.number_input(T["rest_tool_dia"], value=1.0, min_value=0.1, step=0.1, key="rdia")
+            with c8: rstp = st.number_input(T["pitch"], value=0.5, min_value=0.01, key="rstp")
+            frest = st.number_input(T["rough_feed"], value=200, min_value=1, key="frest")
     
     with tab2:
         enable_c = st.checkbox(T["enable"], value=True, key="cc")
@@ -919,6 +1016,22 @@ with st.sidebar:
         ddz = st.number_input(T["drill_depth"], value=-5.0)
         pck = st.number_input(T["peck"], value=2.0, min_value=0.1)
         fd = st.number_input(T["feed"], value=200, key="fd")
+
+    with tab5:
+        enable_e = st.checkbox(T["enable"], value=True, key="ce")
+        st.caption(T["engrave_help"])
+        e_vbit = st.radio("", T["engrave_tool"], index=0, key="etool", horizontal=True) == T["engrave_tool"][0]
+        if e_vbit:
+            e_ang = st.number_input(T["v_angle"], value=60.0, step=10.0, key="eang")
+        else:
+            e_dia = st.number_input(T["tool_dia"], value=1.0, min_value=0.1, step=0.1, key="edia")
+        c9, c10 = st.columns(2)
+        with c9: e_dep = st.number_input(T["engrave_depth"], value=-0.5, max_value=0.0, step=0.1, key="edep")
+        with c10: e_stp = st.number_input(T["pitch"], value=0.5, min_value=0.01, key="estp")
+        if e_vbit:
+            st.caption(T["line_width"].format(w=2 * abs(e_dep) * math.tan(math.radians(e_ang / 2))))
+        e_f = st.number_input(T["feed"], value=300, min_value=1, key="ef")
+        e_closed = st.checkbox(T["engrave_closed"], value=False, key="eclosed")
         
     st.divider()
     ppn = st.selectbox(T["post_processor"], list(POST_PROCESSORS.keys()))
@@ -938,9 +1051,9 @@ f = st.file_uploader("", type=["dxf"])
 
 if f:
     bn = os.path.splitext(f.name)[0]
-    polys_raw = dxf_to_shapely_list(f.getvalue())
-    if polys_raw:
-        tu = unary_union(polys_raw)
+    polys_raw, lines_raw = dxf_to_shapely_list(f.getvalue())
+    if polys_raw or lines_raw:
+        tu = unary_union(polys_raw + lines_raw)
         minx, miny, maxx, maxy = tu.bounds
         w_size, h_size = maxx-minx, maxy-miny
         ox, oy = 0, 0
@@ -950,13 +1063,16 @@ if f:
             ox, oy = -(minx+w_size/2), -(miny+h_size/2)
             
         polys_moved = [translate(p, ox, oy) for p in polys_raw]
+        lines_moved = [translate(l, ox, oy) for l in lines_raw]
         
         st.sidebar.divider()
         st.sidebar.subheader(T["path_select"])
         all_c = st.sidebar.checkbox(T["select_all"], value=True, key="sa")
         selected = [i for i, p in enumerate(polys_moved) if st.sidebar.checkbox(f"Path #{i+1} (Area:{p.area:.1f})", value=all_c, key=f"p{i}")]
+        selected_l = [i for i, l in enumerate(lines_moved) if st.sidebar.checkbox(f"{T['open_line']} #{i+1} (L:{l.length:.1f})", value=all_c, key=f"l{i}")]
                 
         target_polys = [polys_moved[i] for i in selected]
+        target_lines = [lines_moved[i] for i in selected_l]
         gfc = merge_polygons_xor(target_polys)
         
         # 穴情報の解析
@@ -983,6 +1099,9 @@ if f:
                 ax.plot(*p.exterior.xy, style, alpha=alpha, linewidth=1)
                 for interior in p.interiors:
                     ax.plot(*interior.xy, style, alpha=alpha, linewidth=1)
+            for i, l in enumerate(lines_moved):
+                ax.plot(*l.xy, '-' if i in selected_l else ':', color='tab:orange',
+                        alpha=1.0 if i in selected_l else 0.2, linewidth=1.2)
             for pt in drill_points_found:
                 ax.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
             ax.axis('equal')
@@ -990,8 +1109,9 @@ if f:
             st.pyplot(fig)
             
         with c_right:
-            gc_v, gc_p, gc_c, gc_d = None, None, None, None
-            v_d, p_r_d, p_f_d, c_d = [], [], [], []
+            gc_v, gc_p, gc_c, gc_d, gc_e, gc_r = None, None, None, None, None, None
+            v_d, p_r_d, p_f_d, c_d, e_d, r_d = [], [], [], [], [], []
+            unreachable = 0.0
             if gfc and not gfc.is_empty:
                 if enable_v:
                     with st.spinner("VCarve..."):
@@ -1009,6 +1129,16 @@ if f:
                     if p_r: phs_p.append({'name':'Rough','paths':p_r,'z_start':0,'z_final':dep_p,'feed':f_p_r,'z_step':stp_p})
                     if p_f and ucp: phs_p.append({'name':'Finish','paths':p_f,'z_start':0,'z_final':dep_p,'feed':f_p_f,'z_step':(abs(dep_p) if f_mode==T["depth_options"][1] else stp_p)})
                     if phs_p: gc_p = make_gcode_phases_advanced(phs_p, "EndMill", h_c, f_c, pp, tol=out_tol)
+                    covered = swept_area(p_r + p_f, dia / 2.0)
+                    if urp:
+                        # 大径工具で届かなかった部分を小径工具で削る (ATC なしのため別ファイル)
+                        r_d = generate_rest_pocket(gfc, p_r + p_f, dia, rdia, 0.0, 0.5)
+                        if r_d:
+                            gc_r = make_gcode_phases_advanced(
+                                [{'name':'Rest','paths':order_paths(r_d),'z_start':0,'z_final':dep_p,'feed':frest,'z_step':rstp}],
+                                f"EndMill {rdia}mm", h_c, f_c, pp, tol=out_tol)
+                            covered = covered.union(swept_area(r_d, rdia / 2.0))
+                    unreachable = gfc.buffer(-0.05).difference(covered).area
                 if enable_c:
                     rp_c, fp_c = generate_chamfer_separated(gfc, to, cfa if ucf else 0.0)
                     c_d = rp_c + fp_c
@@ -1018,6 +1148,17 @@ if f:
                     if phs_c: gc_c = make_gcode_phases_advanced(phs_c, "Chamfer", h_c, f_c, pp, tol=out_tol)
                 if enable_d:
                     gc_d = generate_drill_gcode(drill_points_found, 0, ddz, pck, fd, f"Drill {ddt}mm", h_c, f_c, pp)
+            if enable_e:
+                # 線彫り: 開いた線 (と必要なら閉じた輪郭) を工具中心でなぞる
+                e_paths = list(target_lines)
+                if e_closed:
+                    for p in target_polys:
+                        e_paths += [LineString(p.exterior.coords)] + [LineString(i.coords) for i in p.interiors]
+                if e_paths:
+                    e_d = order_paths(e_paths)
+                    gc_e = make_gcode_phases_advanced(
+                        [{'name':'Engrave','paths':e_d,'z_start':0,'z_final':e_dep,'feed':e_f,'z_step':e_stp}],
+                        f"VBit {e_ang:g}deg" if e_vbit else f"EndMill {e_dia}mm", h_c, f_c, pp, tol=out_tol)
 
             fig2, ax2 = plt.subplots(figsize=(5,5))
             ax2.plot(0, 0, 'r+', markersize=20)
@@ -1026,25 +1167,30 @@ if f:
                 ax2.plot(*p.exterior.xy, 'k--', alpha=0.05)
             for ls in p_r_d: ax2.plot(*ls.xy, color='tab:blue', alpha=0.3)
             for ls in p_f_d: ax2.plot(*ls.xy, color='tab:cyan', alpha=0.8)
+            for ls in r_d: ax2.plot(*ls.xy, color='navy', alpha=0.6, linewidth=0.7)
             for ls in c_d: ax2.plot(*ls.xy, color='tab:green', alpha=0.8)
+            for ls in e_d: ax2.plot(*ls.xy, color='magenta', alpha=0.9)
             for pts in v_d: ax2.plot([p[0] for p in pts], [p[1] for p in pts], 'r-', linewidth=0.8)
             for pt in drill_points_found:
                 ax2.plot(pt.x, pt.y, 'x', color='tab:purple', markersize=8)
             ax2.axis('equal'); ax2.grid(True, linestyle=':')
             st.pyplot(fig2)
             
-            dl_c1, dl_c2 = st.columns(2)
-            if gc_v: dl_c1.download_button(T["download"][0], gc_v, f"{bn}_vcarve.nc")
-            if gc_p: dl_c2.download_button(T["download"][1], gc_p, f"{bn}_pocket.nc")
-            if gc_c: dl_c1.download_button(T["download"][2], gc_c, f"{bn}_chamfer.nc")
-            if gc_d: dl_c2.download_button(T["download"][3], gc_d, f"{bn}_drill.nc")
+            outputs = [("VCARVE", gc_v, "vcarve"), ("POCKET", gc_p, "pocket"), ("CHAMFER", gc_c, "chamfer"),
+                       ("DRILL", gc_d, "drill"), ("ENGRAVE", gc_e, "engrave"), ("POCKET REST", gc_r, "pocket_rest")]
+            dl_cols = st.columns(2)
+            for k, (name, gc, suffix) in enumerate([o for o in outputs if o[1]]):
+                label = T["download"][[o[0] for o in outputs].index(name)]
+                dl_cols[k % 2].download_button(label, gc, f"{bn}_{suffix}.nc")
+            if unreachable > 0.5:
+                st.info(T["unreachable"].format(a=unreachable))
             max_feed = pp.get("max_feed")
             if max_feed:
-                used = {int(v) for gc in (gc_v, gc_p, gc_c, gc_d) if gc for v in re.findall(r'F(\d+)', gc)}
+                used = {int(v) for _, gc, _ in outputs if gc for v in re.findall(r'F(\d+)', gc)}
                 for fv_used in sorted(v for v in used if v > max_feed):
                     st.warning(T["feed_warning"].format(f=fv_used, m=max_feed))
             # 内蔵メモリ運転の目安になるよう、各ファイルのサイズを表示する
-            for name, gc in (("VCARVE", gc_v), ("POCKET", gc_p), ("CHAMFER", gc_c), ("DRILL", gc_d)):
+            for name, gc, _ in outputs:
                 if gc:
                     st.caption(T["file_size"].format(name=name, kb=len(gc.encode()) / 1024, lines=gc.count("\n")))
 
@@ -1052,11 +1198,13 @@ if f:
             st.header(T["preview_header"])
             jobs = []
             if gc_p: jobs.append((gc_p, 'flat', dia, 0.0))
+            if gc_r: jobs.append((gc_r, 'flat', rdia, 0.0))
             if gc_d: jobs.append((gc_d, 'flat', ddt, 0.0))
             if gc_c: jobs.append((gc_c, 'vbit', 0.0, 90.0))
             if gc_v: jobs.append((gc_v, 'vbit', 0.0, va))
+            if gc_e: jobs.append((gc_e, 'vbit', 0.0, e_ang) if e_vbit else (gc_e, 'flat', e_dia, 0.0))
             if jobs:
-                bx0, by0, bx1, by1 = unary_union(polys_moved).bounds
+                bx0, by0, bx1, by1 = unary_union(polys_moved + lines_moved).bounds
                 margin = max(5.0, dia / 2 + 2.0, ddt / 2 + 2.0, abs(z_c) + 2.0)
                 sim_bounds = (bx0 - margin, by0 - margin, bx1 + margin, by1 + margin)
                 # 大きな図面ではセル数が増えすぎないように解像度を自動で粗くする
